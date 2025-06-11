@@ -105,17 +105,32 @@ RUN pip install --no-cache-dir \
     omegaconf \
     hydra-core
 
-# ÉTAPE 8: NeMo EN DERNIER (le plus problématique)
-RUN pip install --no-cache-dir nemo-toolkit[asr]==2.0.0rc0 || \
+# ÉTAPE 8: NeMo avec versions compatibles
+RUN echo "Installing NeMo..." && \
+    pip install --no-cache-dir \
+    pytorch-lightning==2.1.4 \
+    torchmetrics==1.2.1 \
+    omegaconf==2.3.0 \
+    hydra-core==1.3.2
+
+# Essayer plusieurs versions de NeMo
+RUN pip install --no-cache-dir nemo-toolkit[asr]==1.22.0 || \
+    pip install --no-cache-dir nemo-toolkit[asr]==2.0.0rc0 || \
     pip install --no-cache-dir nemo-toolkit[asr] || \
-    echo "Warning: NeMo installation failed, will use basic diarization"
+    echo "Warning: All NeMo installations failed"
 
-# Test final de tous les imports critiques
-RUN python -c "import torch; import faster_whisper; import runpod; print('Core imports: OK')" || \
-    echo "Warning: Some core imports failed"
-
-RUN python -c "import nemo; print('NeMo: OK')" || \
-    echo "Warning: NeMo import failed - basic diarization only"
+# Test final des imports avec debug
+RUN python -c "
+try:
+    import nemo
+    print('✅ NeMo imported, version:', nemo.__version__)
+    from nemo.collections.asr.models.msdd_models import NeuralDiarizer
+    print('✅ NeuralDiarizer imported successfully')
+except Exception as e:
+    print('❌ NeMo error:', e)
+    import traceback
+    traceback.print_exc()
+"
 
 # Dossier de travail
 WORKDIR /app
