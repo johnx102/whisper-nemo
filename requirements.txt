@@ -5,4 +5,51 @@ faster-whisper>=1.1.0
 git+https://github.com/MahmoudAshraf97/demucs.git
 git+https://github.com/oliverguhr/deepmultilingualpunctuation.git
 git+https://github.com/MahmoudAshraf97/ctc-forced-aligner.git
+cython
+# Versions NumPy/Numba compatibles (CRITIQUE)
+numpy>=1.21.0,<2.0.0
+numba>=0.56.0,<0.60.0
 
+# Whisper et dependencies
+faster-whisper>=1.1.0
+
+# NeMo avec version stable
+nemo_toolkit[asr]==2.0.0rc0
+
+# Projets forkés/personnalisés du repository original
+git+https://github.com/MahmoudAshraf97/demucs.git
+git+https://github.com/oliverguhr/deepmultilingualpunctuation.git
+git+https://github.com/MahmoudAshraf97/ctc-forced-aligner.git
+
+# Dependencies PyTorch (avec CUDA)
+torch>=2.0.0,<2.5.0
+torchaudio>=2.0.0,<2.5.0
+
+# Audio processing
+librosa>=0.10.0,<0.11.0
+soundfile>=0.12.0
+scipy>=1.10.0
+
+# ML et NLP
+transformers>=4.30.0
+tokenizers>=0.13.0
+huggingface-hub>=0.16.0
+
+# RunPod et API
+runpod>=1.7.0
+fastapi>=0.100.0
+uvicorn[standard]>=0.23.0
+aiohttp>=3.8.0
+aiofiles>=23.0.0
+pydantic>=2.0.0
+
+# Utilitaires
+pandas>=1.5.0
+matplotlib>=3.6.0
+pyyaml>=6.0
+omegaconf>=2.3.0
+hydra-core>=1.3.0
+
+# Alignment et punctuation
+phonemizer>=3.2.0
+gruut>=2.2.0
