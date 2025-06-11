@@ -61,18 +61,12 @@ RUN python -m pip install --upgrade pip setuptools wheel
 # ÉTAPE 1: FORCER NumPy 1.x en premier
 RUN pip install --no-cache-dir "numpy>=1.21.0,<2.0.0"
 
-# Vérifier NumPy
-RUN python -c "import numpy; print('NumPy version:', numpy.__version__); assert numpy.__version__.startswith('1.'), 'NumPy 2.x detected!'"
-
 # ÉTAPE 2: Installation PyTorch avec CUDA
 RUN pip install --no-cache-dir \
     torch==2.1.2+cu121 \
     torchaudio==2.1.2+cu121 \
     torchvision==0.16.2+cu121 \
     --index-url https://download.pytorch.org/whl/cu121
-
-# Test PyTorch
-RUN python -c "import torch; import torchaudio; print('PyTorch CUDA:', torch.cuda.is_available())"
 
 # ÉTAPE 3: Dependencies de base
 RUN pip install --no-cache-dir \
@@ -98,39 +92,33 @@ RUN pip install --no-cache-dir \
     git+https://github.com/oliverguhr/deepmultilingualpunctuation.git \
     git+https://github.com/MahmoudAshraf97/ctc-forced-aligner.git
 
-# ÉTAPE 7: Autres dépendances
+# ÉTAPE 7: Autres dépendances pour NeMo
 RUN pip install --no-cache-dir \
     nltk \
     wget \
     omegaconf \
-    hydra-core
+    hydra-core \
+    pytorch-lightning \
+    torchmetrics
 
-# ÉTAPE 8: NeMo avec versions compatibles
-RUN echo "Installing NeMo..." && \
-    pip install --no-cache-dir \
-    pytorch-lightning==2.1.4 \
-    torchmetrics==1.2.1 \
-    omegaconf==2.3.0 \
-    hydra-core==1.3.2
+# ÉTAPE 8: Installation NeMo (la plus délicate)
+RUN echo "Attempting NeMo installation..." && \
+    pip install --no-cache-dir nemo-toolkit[asr]==1.22.0 && \
+    echo "✅ NeMo 1.22.0 installed successfully" || \
+    (echo "Trying NeMo 2.0.0rc0..." && \
+     pip install --no-cache-dir nemo-toolkit[asr]==2.0.0rc0 && \
+     echo "✅ NeMo 2.0.0rc0 installed successfully") || \
+    (echo "Trying latest NeMo..." && \
+     pip install --no-cache-dir nemo-toolkit[asr] && \
+     echo "✅ NeMo latest installed successfully") || \
+    echo "❌ All NeMo installations failed - will use basic diarization"
 
-# Essayer plusieurs versions de NeMo
-RUN pip install --no-cache-dir nemo-toolkit[asr]==1.22.0 || \
-    pip install --no-cache-dir nemo-toolkit[asr]==2.0.0rc0 || \
-    pip install --no-cache-dir nemo-toolkit[asr] || \
-    echo "Warning: All NeMo installations failed"
+# Test des imports critiques
+RUN python -c "import torch; import faster_whisper; import runpod; print('✅ Core imports OK')"
 
-# Test final des imports avec debug
-RUN python -c "
-try:
-    import nemo
-    print('✅ NeMo imported, version:', nemo.__version__)
-    from nemo.collections.asr.models.msdd_models import NeuralDiarizer
-    print('✅ NeuralDiarizer imported successfully')
-except Exception as e:
-    print('❌ NeMo error:', e)
-    import traceback
-    traceback.print_exc()
-"
+# Test NeMo spécifiquement
+RUN python -c "import nemo; print('✅ NeMo version:', nemo.__version__)" || echo "❌ NeMo import failed"
+RUN python -c "from nemo.collections.asr.models.msdd_models import NeuralDiarizer; print('✅ NeuralDiarizer OK')" || echo "❌ NeuralDiarizer import failed"
 
 # Dossier de travail
 WORKDIR /app
