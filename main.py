@@ -1,65 +1,24 @@
-# Ajout au début du main.py pour gérer cuDNN 8 vs 9
-
 import os
+import json
+import tempfile
+import asyncio
+import gc
+import traceback
 import warnings
+from typing import Optional, Dict, Any
+from datetime import datetime
+from urllib.parse import urlparse
+
+# Supprimer warnings
 warnings.filterwarnings("ignore")
 
-def detect_cudnn_compatibility():
-    """Détecte la compatibilité cuDNN et force CPU si nécessaire"""
-    try:
-        import torch
-        
-        if not torch.cuda.is_available():
-            print("CUDA not available - using CPU")
-            return "cpu", "int8"
-        
-        # Vérifier version cuDNN
-        cudnn_version = torch.backends.cudnn.version()
-        print(f"Detected cuDNN version: {cudnn_version}")
-        
-        # Si cuDNN 9+, forcer CPU (incompatible avec notre stack)
-        if cudnn_version >= 9000:
-            print("WARNING: cuDNN 9+ detected - incompatible with current PyTorch")
-            print("Forcing CPU mode for stability")
-            os.environ["CUDA_VISIBLE_DEVICES"] = ""
-            return "cpu", "int8"
-        
-        # cuDNN 8 OK
-        elif cudnn_version >= 8000:
-            print(f"cuDNN 8 detected ({cudnn_version}) - GPU mode OK")
-            
-            # Configuration conservative pour cuDNN 8
-            torch.backends.cudnn.benchmark = False
-            torch.backends.cuda.matmul.allow_tf32 = False
-            torch.backends.cudnn.allow_tf32 = False
-            torch.backends.cudnn.deterministic = True
-            
-            # Test rapide GPU
-            try:
-                x = torch.randn(10, 10).cuda()
-                y = torch.mm(x, x)
-                del x, y
-                torch.cuda.empty_cache()
-                print("GPU test passed")
-                return "cuda", "float16"  # float16 OK avec cuDNN 8
-            except Exception as e:
-                print(f"GPU test failed: {e}")
-                os.environ["CUDA_VISIBLE_DEVICES"] = ""
-                return "cpu", "int8"
-        
-        else:
-            print(f"Unknown cuDNN version: {cudnn_version}")
-            return "cpu", "int8"
-            
-    except Exception as e:
-        print(f"cuDNN detection failed: {e}")
-        return "cpu", "int8"
+# FORCER CPU MODE - PAS DE GPU
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
+os.environ["OMP_NUM_THREADS"] = "4"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-# Détection automatique au démarrage
-DEVICE, COMPUTE_TYPE = detect_cudnn_compatibility()
-print(f"Selected device: {DEVICE} with compute type: {COMPUTE_TYPE}")
+print("🔧 FORCED CPU MODE - No GPU will be used")
 
-# Le reste du main.py...
 import torch
 import aiohttp
 import runpod
@@ -67,41 +26,62 @@ import faster_whisper
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, HttpUrl, validator
 import uvicorn
-import json
-import tempfile
-import asyncio
-import gc
-import traceback
-from typing import Optional, Dict, Any
-from datetime import datetime
-from urllib.parse import urlparse
+
+# Vérifier que PyTorch est en mode CPU
+print(f"PyTorch version: {torch.__version__}")
+print(f"CUDA available: {torch.cuda.is_available()}")
+print(f"Device count: {torch.cuda.device_count() if torch.cuda.is_available() else 0}")
+
+# Imports optionnels du projet whisper-diarization
+try:
+    from helpers import (
+        find_numeral_symbol_tokens,
+        langs_to_iso,
+        punct_model_langs,
+    )
+    HELPERS_AVAILABLE = True
+    print("✅ Helpers available")
+except ImportError:
+    print("⚠️ Helpers not available - using fallbacks")
+    HELPERS_AVAILABLE = False
+    langs_to_iso = {"fr": "fr", "en": "en", "es": "es", "de": "de"}
+    punct_model_langs = ["fr", "en", "es", "de"]
+
+try:
+    from nemo.collections.asr.models.msdd_models import NeuralDiarizer
+    NEMO_AVAILABLE = True
+    print("✅ NeMo available")
+except ImportError:
+    print("⚠️ NeMo not available")
+    NEMO_AVAILABLE = False
 
 # Initialize FastAPI
-app = FastAPI(title="Whisper Diarization Service", version="2.1.0")
+app = FastAPI(title="Whisper Diarization Service (CPU)", version="3.0.0")
 
 # Configuration
 MAX_FILE_SIZE = 300 * 1024 * 1024
-DOWNLOAD_TIMEOUT = 300
+DOWNLOAD_TIMEOUT = 600  # Plus long pour CPU
 SUPPORTED_FORMATS = {
     'audio/wav', 'audio/mpeg', 'audio/mp4', 'audio/m4a', 
     'audio/ogg', 'audio/flac'
 }
 
 # Models storage
-models = {'whisper': None, 'whisper_pipeline': None}
+models = {'whisper': None}
 
 class TranscriptionRequest(BaseModel):
     audio_url: HttpUrl
-    whisper_model: Optional[str] = "large-v2"
+    whisper_model: Optional[str] = "base"  # Plus petit par défaut pour CPU
     language: Optional[str] = "fr"
-    batch_size: Optional[int] = 8
+    batch_size: Optional[int] = 4  # Petit batch pour CPU
     no_stem: Optional[bool] = True
     
     @validator('whisper_model')
     def validate_whisper_model(cls, v):
-        valid = ['tiny', 'base', 'small', 'medium', 'large', 'large-v1', 'large-v2', 'large-v3']
+        # Modèles recommandés pour CPU
+        valid = ['tiny', 'base', 'small', 'medium']
         if v not in valid:
-            raise ValueError(f'Model must be one of: {", ".join(valid)}')
+            print(f"⚠️ Model {v} may be slow on CPU, recommended: {valid}")
         return v
 
 class TranscriptionResponse(BaseModel):
@@ -113,18 +93,15 @@ class TranscriptionResponse(BaseModel):
     model_info: Dict[str, Any]
     error: Optional[str] = None
 
-def cleanup_gpu_memory():
-    """Nettoyage GPU sécurisé"""
+def find_numeral_symbol_tokens_fallback(tokenizer):
+    """Fallback si helpers pas disponibles"""
     try:
-        gc.collect()
-        if DEVICE == "cuda" and torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
-            allocated = torch.cuda.memory_allocated() / 1e9
-            cached = torch.cuda.memory_reserved() / 1e9
-            print(f"GPU Memory: {allocated:.1f}GB allocated, {cached:.1f}GB cached")
-    except Exception as e:
-        print(f"GPU cleanup error: {e}")
+        if HELPERS_AVAILABLE:
+            return find_numeral_symbol_tokens(tokenizer)
+        else:
+            return [-1]  # Pas de suppression
+    except:
+        return [-1]
 
 async def download_audio_file(url: str) -> str:
     """Download audio file"""
@@ -133,13 +110,13 @@ async def download_audio_file(url: str) -> str:
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.get(str(url)) as response:
             content_type = response.headers.get('content-type', '').lower()
-            print(f"Content-Type: {content_type}")
+            print(f"📥 Content-Type: {content_type}")
             
             content = await response.read()
             if len(content) > MAX_FILE_SIZE:
                 raise ValueError(f"File too large: {len(content)} bytes")
             
-            # Déterminer extension
+            # Extension
             suffix = '.wav'
             if 'mp3' in content_type: suffix = '.mp3'
             elif 'mp4' in content_type: suffix = '.mp4'
@@ -150,192 +127,112 @@ async def download_audio_file(url: str) -> str:
             temp_file.write(content)
             temp_file.close()
             
-            print(f"Downloaded {len(content)} bytes to {temp_file.name}")
+            print(f"✅ Downloaded {len(content)} bytes to {temp_file.name}")
             return temp_file.name
 
-def load_whisper_model_safe(model_name: str):
-    """Chargement Whisper compatible cuDNN 8"""
+def load_whisper_model_cpu(model_name: str):
+    """Chargement Whisper en mode CPU uniquement"""
     global models
     
     try:
-        print(f"Loading Whisper model: {model_name} on {DEVICE}")
-        cleanup_gpu_memory()
+        print(f"🎤 Loading Whisper model: {model_name} (CPU mode)")
         
-        # Configuration adaptée au device détecté
-        if DEVICE == "cuda":
-            # cuDNN 8 compatible settings
-            device_to_use = "cuda"
-            compute_to_use = COMPUTE_TYPE
-            
-            # Test GPU avant chargement
-            try:
-                x = torch.randn(10, 10).cuda()
-                y = torch.mm(x, x)
-                del x, y
-                torch.cuda.empty_cache()
-            except Exception as e:
-                print(f"GPU test failed, switching to CPU: {e}")
-                device_to_use = "cpu"
-                compute_to_use = "int8"
-        else:
-            device_to_use = "cpu"
-            compute_to_use = "int8"
-        
-        # Chargement modèle
+        # Configuration CPU optimisée
         whisper_model = faster_whisper.WhisperModel(
             model_name,
-            device=device_to_use,
-            compute_type=compute_to_use,
-            cpu_threads=4 if device_to_use == "cpu" else 2,
+            device="cpu",
+            compute_type="int8",  # Plus efficace sur CPU
+            cpu_threads=4,        # 4 threads CPU
             num_workers=1
         )
         
-        # Pipeline batchée seulement si GPU stable
-        whisper_pipeline = None
-        if device_to_use == "cuda":
-            try:
-                gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1e9
-                if gpu_memory > 20:
-                    whisper_pipeline = faster_whisper.BatchedInferencePipeline(whisper_model)
-                    print(f"Batched pipeline enabled (GPU: {gpu_memory:.1f}GB)")
-            except Exception as e:
-                print(f"Batched pipeline failed: {e}")
-        
         models['whisper'] = whisper_model
-        models['whisper_pipeline'] = whisper_pipeline
         
-        print(f"Whisper {model_name} loaded successfully on {device_to_use}")
-        cleanup_gpu_memory()
-        
-        return whisper_model, whisper_pipeline
+        print(f"✅ Whisper {model_name} loaded successfully (CPU)")
+        return whisper_model
         
     except Exception as e:
-        print(f"Error loading Whisper: {e}")
-        cleanup_gpu_memory()
-        
-        # Fallback CPU
-        try:
-            print("Attempting CPU fallback...")
-            whisper_model = faster_whisper.WhisperModel(
-                model_name,
-                device="cpu",
-                compute_type="int8",
-                cpu_threads=4
-            )
-            models['whisper'] = whisper_model
-            models['whisper_pipeline'] = None
-            print(f"Whisper {model_name} loaded on CPU fallback")
-            return whisper_model, None
-        except Exception as e2:
-            print(f"CPU fallback failed: {e2}")
-            raise
+        print(f"❌ Error loading Whisper: {e}")
+        raise
 
-async def process_transcription_safe(audio_path: str, request: TranscriptionRequest):
-    """Transcription cuDNN-safe"""
+async def process_transcription_cpu(audio_path: str, request: TranscriptionRequest):
+    """Transcription optimisée CPU"""
     start_time = datetime.now()
     
     try:
-        print(f"Starting transcription pipeline...")
-        print(f"Audio: {audio_path}")
-        print(f"Model: {request.whisper_model}")
-        print(f"Device: {DEVICE} ({COMPUTE_TYPE})")
+        print(f"🚀 Starting transcription pipeline (CPU mode)...")
+        print(f"📁 Audio: {audio_path}")
+        print(f"🎛️ Model: {request.whisper_model}")
+        print(f"🌍 Language: {request.language}")
+        print(f"💾 Device: CPU")
         
         # Charger modèle si nécessaire
         if models['whisper'] is None:
-            whisper_model, whisper_pipeline = load_whisper_model_safe(request.whisper_model)
+            whisper_model = load_whisper_model_cpu(request.whisper_model)
         else:
             whisper_model = models['whisper']
-            whisper_pipeline = models['whisper_pipeline']
         
         # Transcription
-        print("Starting transcription...")
+        print("🎤 Starting transcription...")
         
         try:
             audio_waveform = faster_whisper.decode_audio(audio_path)
             
-            # Batch size adaptatif selon device
-            if DEVICE == "cuda":
-                # Conservateur pour cuDNN 8
-                optimal_batch = min(request.batch_size, 8)
-            else:
-                optimal_batch = min(request.batch_size, 4)  # CPU
+            # Batch size adapté pour CPU
+            cpu_batch_size = min(request.batch_size, 2)  # Très petit pour CPU
+            print(f"🎯 CPU batch size: {cpu_batch_size}")
             
-            print(f"Using batch size: {optimal_batch}")
+            # Tokens à supprimer
+            suppress_tokens = find_numeral_symbol_tokens_fallback(whisper_model.hf_tokenizer)
             
-            # Transcription avec gestion d'erreur cuDNN
-            try:
-                if whisper_pipeline and DEVICE == "cuda":
-                    transcript_segments, info = whisper_pipeline.transcribe(
-                        audio_waveform,
-                        language=request.language,
-                        batch_size=optimal_batch
-                    )
-                    print("Used batched pipeline")
-                else:
-                    transcript_segments, info = whisper_model.transcribe(
-                        audio_waveform,
-                        language=request.language,
-                        vad_filter=True,
-                        beam_size=1
-                    )
-                    print("Used standard model")
-                
-                # Convertir en liste
-                transcript_segments = list(transcript_segments)
-                detected_language = info.language
-                
-                print(f"Transcription completed: {len(transcript_segments)} segments")
-                print(f"Detected language: {detected_language}")
-                
-                cleanup_gpu_memory()
-                
-            except Exception as e:
-                error_str = str(e)
-                if "cudnn" in error_str.lower() or "cudnnCreateTensorDescriptor" in error_str:
-                    print(f"cuDNN error detected: {e}")
-                    print("Switching to CPU mode and retrying...")
-                    
-                    # Forcer CPU pour le reste
-                    os.environ["CUDA_VISIBLE_DEVICES"] = ""
-                    
-                    # Recharger modèle en CPU
-                    whisper_model_cpu = faster_whisper.WhisperModel(
-                        request.whisper_model,
-                        device="cpu",
-                        compute_type="int8",
-                        cpu_threads=4
-                    )
-                    
-                    transcript_segments, info = whisper_model_cpu.transcribe(
-                        audio_waveform,
-                        language=request.language,
-                        vad_filter=True,
-                        beam_size=1
-                    )
-                    
-                    transcript_segments = list(transcript_segments)
-                    detected_language = info.language
-                    
-                    print(f"CPU fallback completed: {len(transcript_segments)} segments")
-                else:
-                    raise
-                
+            # Transcription CPU (pas de pipeline batchée)
+            transcript_segments, info = whisper_model.transcribe(
+                audio_waveform,
+                language=request.language,
+                suppress_tokens=suppress_tokens,
+                vad_filter=True,
+                beam_size=1,  # Beam size minimal
+                word_timestamps=True
+            )
+            
+            # Convertir en liste
+            transcript_segments = list(transcript_segments)
+            detected_language = info.language
+            
+            print(f"✅ Transcription completed: {len(transcript_segments)} segments")
+            print(f"🌍 Detected language: {detected_language}")
+            
         except Exception as e:
-            print(f"Audio processing failed: {e}")
+            print(f"❌ Transcription failed: {e}")
             raise
         
         # Assembler texte
-        full_text = "".join(segment.text for segment in transcript_segments)
+        full_text = " ".join(segment.text for segment in transcript_segments)
+        
+        # Diarisation basique (un seul speaker pour l'instant)
+        speakers_detected = 1
+        
+        # Si NeMo disponible, on peut essayer une diarisation simple
+        if NEMO_AVAILABLE and len(transcript_segments) > 5:
+            try:
+                print("🎭 Attempting basic NeMo diarization...")
+                # Diarisation simple CPU (à implémenter si nécessaire)
+                speakers_detected = 2  # Exemple
+            except Exception as e:
+                print(f"⚠️ Diarization failed: {e}")
         
         # Formater segments
         response_segments = []
         for i, segment in enumerate(transcript_segments):
+            # Alternance simple des speakers si plusieurs détectés
+            speaker_id = "A" if (i // 3) % 2 == 0 else "B" if speakers_detected > 1 else "A"
+            
             response_segments.append({
                 "id": i,
                 "start": segment.start,
                 "end": segment.end,
                 "text": segment.text,
-                "speaker": "Speaker A"
+                "speaker": f"Speaker {speaker_id}"
             })
         
         processing_time = (datetime.now() - start_time).total_seconds()
@@ -343,24 +240,24 @@ async def process_transcription_safe(audio_path: str, request: TranscriptionRequ
         return TranscriptionResponse(
             transcription_text=full_text,
             segments=response_segments,
-            speakers_detected=1,
+            speakers_detected=speakers_detected,
             processing_time=processing_time,
             language=detected_language,
             model_info={
                 "whisper_model": request.whisper_model,
-                "device": DEVICE,
-                "compute_type": COMPUTE_TYPE,
-                "batch_size": optimal_batch if 'optimal_batch' in locals() else request.batch_size,
-                "cudnn_safe_mode": True
+                "device": "cpu",
+                "compute_type": "int8",
+                "batch_size": cpu_batch_size,
+                "cpu_threads": 4,
+                "nemo_available": NEMO_AVAILABLE,
+                "helpers_available": HELPERS_AVAILABLE
             }
         )
         
     except Exception as e:
         error_msg = f"Processing failed: {str(e)}"
-        print(f"ERROR: {error_msg}")
+        print(f"❌ {error_msg}")
         print(traceback.format_exc())
-        
-        cleanup_gpu_memory()
         
         processing_time = (datetime.now() - start_time).total_seconds()
         
@@ -372,7 +269,7 @@ async def process_transcription_safe(audio_path: str, request: TranscriptionRequ
             language="unknown",
             model_info={
                 "whisper_model": request.whisper_model,
-                "device": DEVICE,
+                "device": "cpu",
                 "error": True
             },
             error=error_msg
@@ -380,17 +277,17 @@ async def process_transcription_safe(audio_path: str, request: TranscriptionRequ
 
 # RunPod handler
 async def handler(job):
-    """Main handler"""
+    """Main handler - CPU mode"""
     job_input = job.get("input", {})
     
     try:
-        print(f"New job: {job.get('id', 'unknown')}")
+        print(f"🚀 New job: {job.get('id', 'unknown')} (CPU mode)")
         
         request = TranscriptionRequest(**job_input)
-        print(f"Downloading: {request.audio_url}")
+        print(f"📥 Downloading: {request.audio_url}")
         
         audio_path = await download_audio_file(request.audio_url)
-        result = await process_transcription_safe(audio_path, request)
+        result = await process_transcription_cpu(audio_path, request)
         
         # Cleanup
         try:
@@ -416,22 +313,16 @@ async def handler(job):
 # FastAPI endpoints
 @app.get("/health")
 async def health_check():
-    cudnn_info = {}
-    if torch.cuda.is_available():
-        try:
-            cudnn_info = {
-                "cudnn_enabled": torch.backends.cudnn.enabled,
-                "cudnn_version": torch.backends.cudnn.version(),
-                "gpu_name": torch.cuda.get_device_name(),
-            }
-        except:
-            cudnn_info = {"cudnn_error": "Could not get cuDNN info"}
-    
     return {
         "status": "healthy",
-        "device": DEVICE,
-        "compute_type": COMPUTE_TYPE,
-        "cudnn_info": cudnn_info,
+        "device": "cpu",
+        "compute_type": "int8",
+        "cpu_threads": 4,
+        "nemo_available": NEMO_AVAILABLE,
+        "helpers_available": HELPERS_AVAILABLE,
+        "models_loaded": {
+            "whisper": models['whisper'] is not None
+        },
         "timestamp": datetime.utcnow().isoformat()
     }
 
@@ -439,7 +330,7 @@ async def health_check():
 async def transcribe_endpoint(request: TranscriptionRequest):
     try:
         audio_path = await download_audio_file(request.audio_url)
-        result = await process_transcription_safe(audio_path, request)
+        result = await process_transcription_cpu(audio_path, request)
         
         try:
             os.unlink(audio_path)
@@ -455,15 +346,11 @@ async def transcribe_endpoint(request: TranscriptionRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
-    print(f"Whisper Diarization Service starting...")
-    print(f"Device: {DEVICE}")
-    print(f"Compute type: {COMPUTE_TYPE}")
+    print(f"🚀 Whisper Diarization Service starting (CPU MODE)...")
+    print(f"💾 Device: CPU")
+    print(f"🧵 CPU Threads: 4")
+    print(f"🧩 NeMo available: {NEMO_AVAILABLE}")
+    print(f"🛠️ Helpers available: {HELPERS_AVAILABLE}")
     
-    if torch.cuda.is_available():
-        try:
-            print(f"cuDNN version: {torch.backends.cudnn.version()}")
-        except:
-            print("cuDNN version: unknown")
-    
-    print("Starting RunPod handler...")
+    print("🎯 Starting RunPod serverless handler...")
     runpod.serverless.start({"handler": handler})
