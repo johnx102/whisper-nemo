@@ -59,6 +59,15 @@ RUN mkdir -p /usr/local/cuda/lib64 && \
 # Dossier de travail
 WORKDIR /app
 
+# Upgrade pip et FORCER NumPy 1.x
+RUN python -m pip install --upgrade pip setuptools wheel
+
+# CRITIQUE: Installer NumPy 1.x AVANT tout le reste
+RUN pip install --no-cache-dir "numpy>=1.21.0,<2.0.0"
+
+# Vérifier NumPy version
+RUN python -c "import numpy; print('NumPy version:', numpy.__version__); assert numpy.__version__.startswith('1.'), 'NumPy 2.x detected!'"
+
 # Installation de PyTorch AVANT les autres packages (ordre important!)
 RUN pip install --no-cache-dir \
     torch==2.1.2+cu121 \
@@ -78,8 +87,8 @@ RUN pip install --no-cache-dir \
     git+https://github.com/oliverguhr/deepmultilingualpunctuation.git \
     git+https://github.com/MahmoudAshraf97/ctc-forced-aligner.git
 
-# Installation des autres dépendances
-RUN pip install --no-cache-dir \
+# Installation des autres dépendances SANS mettre à jour NumPy
+RUN pip install --no-cache-dir --no-deps \
     nltk \
     wget \
     runpod>=1.6.2 \
@@ -88,10 +97,18 @@ RUN pip install --no-cache-dir \
     aiohttp>=3.9.0 \
     pydantic>=2.5.0
 
-# Installation de NeMo EN DERNIER (cause le plus de problèmes)
-RUN pip install --no-cache-dir nemo-toolkit[asr]==2.0.0rc0 || \
-    pip install --no-cache-dir nemo-toolkit[asr] || \
+# Installation de NeMo EN DERNIER avec contrainte NumPy
+RUN pip install --no-cache-dir "nemo-toolkit[asr]==2.0.0rc0" --no-deps || \
+    pip install --no-cache-dir "nemo-toolkit[asr]" --no-deps || \
     echo "Warning: NeMo installation failed, basic diarization only"
+
+# Réinstaller les dépendances manquantes de NeMo sans toucher NumPy
+RUN pip install --no-cache-dir \
+    omegaconf \
+    hydra-core \
+    pytorch-lightning \
+    torchmetrics \
+    || echo "Some NeMo dependencies failed"
 
 # Test final
 RUN python -c "import torch; import torchaudio; print('All imports OK')" || \
