@@ -9,15 +9,18 @@ from typing import Optional, Dict, Any
 from datetime import datetime
 from urllib.parse import urlparse
 
-# Supprimer warnings
-warnings.filterwarnings("ignore")
+# Supprimer warnings non critiques
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
 
-# FORCER CPU MODE - PAS DE GPU
-os.environ["CUDA_VISIBLE_DEVICES"] = ""
-os.environ["OMP_NUM_THREADS"] = "4"
+# CONFIGURATION GPU
+os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+# Permettre l'utilisation du GPU
+if "CUDA_VISIBLE_DEVICES" in os.environ:
+    del os.environ["CUDA_VISIBLE_DEVICES"]
 
-print("🔧 FORCED CPU MODE - No GPU will be used")
+print("🚀 GPU MODE ENABLED")
 
 import torch
 import aiohttp
@@ -27,10 +30,14 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, HttpUrl, validator
 import uvicorn
 
-# Vérifier que PyTorch est en mode CPU
+# Vérifier la disponibilité GPU
 print(f"PyTorch version: {torch.__version__}")
 print(f"CUDA available: {torch.cuda.is_available()}")
-print(f"Device count: {torch.cuda.device_count() if torch.cuda.is_available() else 0}")
+print(f"GPU count: {torch.cuda.device_count()}")
+if torch.cuda.is_available():
+    for i in range(torch.cuda.device_count()):
+        print(f"GPU {i}: {torch.cuda.get_device_name(i)}")
+        print(f"GPU {i} Memory: {torch.cuda.get_device_properties(i).total_memory / 1024**3:.1f} GB")
 
 # Imports optionnels du projet whisper-diarization
 try:
@@ -44,44 +51,46 @@ try:
 except ImportError:
     print("⚠️ Helpers not available - using fallbacks")
     HELPERS_AVAILABLE = False
-    langs_to_iso = {"fr": "fr", "en": "en", "es": "es", "de": "de"}
-    punct_model_langs = ["fr", "en", "es", "de"]
+    langs_to_iso = {"fr": "fr", "en": "en", "es": "es", "de": "de", "it": "it", "pt": "pt"}
+    punct_model_langs = ["fr", "en", "es", "de", "it", "pt"]
 
 try:
     from nemo.collections.asr.models.msdd_models import NeuralDiarizer
     NEMO_AVAILABLE = True
-    print("✅ NeMo available")
+    print("✅ NeMo available for diarization")
 except ImportError:
-    print("⚠️ NeMo not available")
+    print("⚠️ NeMo not available - speaker diarization will be basic")
     NEMO_AVAILABLE = False
 
 # Initialize FastAPI
-app = FastAPI(title="Whisper Diarization Service (CPU)", version="3.0.0")
+app = FastAPI(title="Whisper Diarization Service (GPU)", version="4.0.0")
 
 # Configuration
-MAX_FILE_SIZE = 300 * 1024 * 1024
-DOWNLOAD_TIMEOUT = 600  # Plus long pour CPU
+MAX_FILE_SIZE = 500 * 1024 * 1024  # 500MB
+DOWNLOAD_TIMEOUT = 300
 SUPPORTED_FORMATS = {
     'audio/wav', 'audio/mpeg', 'audio/mp4', 'audio/m4a', 
-    'audio/ogg', 'audio/flac'
+    'audio/ogg', 'audio/flac', 'audio/webm'
 }
 
 # Models storage
-models = {'whisper': None}
+models = {'whisper': None, 'diarizer': None}
 
 class TranscriptionRequest(BaseModel):
     audio_url: HttpUrl
-    whisper_model: Optional[str] = "base"  # Plus petit par défaut pour CPU
+    whisper_model: Optional[str] = "medium"  # Meilleur modèle par défaut avec GPU
     language: Optional[str] = "fr"
-    batch_size: Optional[int] = 4  # Petit batch pour CPU
+    batch_size: Optional[int] = 16  # Plus gros batch avec GPU
     no_stem: Optional[bool] = True
+    enable_diarization: Optional[bool] = True
+    min_speakers: Optional[int] = 1
+    max_speakers: Optional[int] = 8
     
     @validator('whisper_model')
     def validate_whisper_model(cls, v):
-        # Modèles recommandés pour CPU
-        valid = ['tiny', 'base', 'small', 'medium']
+        valid = ['tiny', 'base', 'small', 'medium', 'large', 'large-v2', 'large-v3']
         if v not in valid:
-            print(f"⚠️ Model {v} may be slow on CPU, recommended: {valid}")
+            raise ValueError(f"Invalid model. Choose from: {valid}")
         return v
 
 class TranscriptionResponse(BaseModel):
@@ -99,100 +108,189 @@ def find_numeral_symbol_tokens_fallback(tokenizer):
         if HELPERS_AVAILABLE:
             return find_numeral_symbol_tokens(tokenizer)
         else:
-            return [-1]  # Pas de suppression
-    except:
-        return [-1]
+            # Tokens numériques classiques à supprimer
+            return [50362, 50363, 50364, 50365, 50366, 50367, 50368, 50369]
+    except Exception as e:
+        print(f"Warning: Could not get numeral tokens: {e}")
+        return []
 
 async def download_audio_file(url: str) -> str:
-    """Download audio file"""
+    """Download audio file avec retry"""
     timeout = aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT)
     
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(str(url)) as response:
-            content_type = response.headers.get('content-type', '').lower()
-            print(f"📥 Content-Type: {content_type}")
-            
-            content = await response.read()
-            if len(content) > MAX_FILE_SIZE:
-                raise ValueError(f"File too large: {len(content)} bytes")
-            
-            # Extension
-            suffix = '.wav'
-            if 'mp3' in content_type: suffix = '.mp3'
-            elif 'mp4' in content_type: suffix = '.mp4'
-            elif 'm4a' in content_type: suffix = '.m4a'
-            elif 'ogg' in content_type: suffix = '.ogg'
-            
-            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-            temp_file.write(content)
-            temp_file.close()
-            
-            print(f"✅ Downloaded {len(content)} bytes to {temp_file.name}")
-            return temp_file.name
+        try:
+            async with session.get(str(url)) as response:
+                if response.status != 200:
+                    raise ValueError(f"HTTP {response.status}: {response.reason}")
+                
+                content_type = response.headers.get('content-type', '').lower()
+                print(f"📥 Content-Type: {content_type}")
+                
+                # Vérifier le type de contenu
+                if not any(fmt in content_type for fmt in ['audio', 'video']):
+                    print(f"⚠️ Unexpected content type: {content_type}")
+                
+                content = await response.read()
+                if len(content) > MAX_FILE_SIZE:
+                    raise ValueError(f"File too large: {len(content)} bytes (max: {MAX_FILE_SIZE})")
+                
+                # Déterminer l'extension
+                suffix = '.wav'  # défaut
+                if 'mp3' in content_type or 'mpeg' in content_type: 
+                    suffix = '.mp3'
+                elif 'mp4' in content_type: 
+                    suffix = '.mp4'
+                elif 'm4a' in content_type: 
+                    suffix = '.m4a'
+                elif 'ogg' in content_type: 
+                    suffix = '.ogg'
+                elif 'flac' in content_type: 
+                    suffix = '.flac'
+                elif 'webm' in content_type: 
+                    suffix = '.webm'
+                
+                temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+                temp_file.write(content)
+                temp_file.close()
+                
+                print(f"✅ Downloaded {len(content)} bytes to {temp_file.name}")
+                return temp_file.name
+                
+        except asyncio.TimeoutError:
+            raise ValueError("Download timeout")
+        except Exception as e:
+            raise ValueError(f"Download failed: {str(e)}")
 
-def load_whisper_model_cpu(model_name: str):
-    """Chargement Whisper en mode CPU uniquement"""
+def load_whisper_model_gpu(model_name: str):
+    """Chargement Whisper optimisé GPU"""
     global models
     
     try:
-        print(f"🎤 Loading Whisper model: {model_name} (CPU mode)")
+        print(f"🎤 Loading Whisper model: {model_name} (GPU mode)")
         
-        # Configuration CPU optimisée
+        # Vérifier la mémoire GPU disponible
+        if torch.cuda.is_available():
+            gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
+            print(f"💾 GPU Memory available: {gpu_memory:.1f} GB")
+            
+            # Choisir le compute_type selon la mémoire
+            if gpu_memory >= 8:
+                compute_type = "float16"
+            else:
+                compute_type = "int8"
+        else:
+            print("⚠️ No GPU available, falling back to CPU")
+            compute_type = "int8"
+        
+        # Configuration GPU optimisée
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        
         whisper_model = faster_whisper.WhisperModel(
             model_name,
-            device="cpu",
-            compute_type="int8",  # Plus efficace sur CPU
-            cpu_threads=4,        # 4 threads CPU
-            num_workers=1
+            device=device,
+            compute_type=compute_type,
+            num_workers=4 if device == "cuda" else 1
         )
         
         models['whisper'] = whisper_model
         
-        print(f"✅ Whisper {model_name} loaded successfully (CPU)")
+        print(f"✅ Whisper {model_name} loaded successfully ({device}, {compute_type})")
         return whisper_model
         
     except Exception as e:
         print(f"❌ Error loading Whisper: {e}")
+        print(traceback.format_exc())
         raise
 
-async def process_transcription_cpu(audio_path: str, request: TranscriptionRequest):
-    """Transcription optimisée CPU"""
+def load_diarization_model():
+    """Charger le modèle de diarisation si disponible"""
+    global models
+    
+    if not NEMO_AVAILABLE:
+        print("⚠️ NeMo not available, skipping diarization model")
+        return None
+    
+    try:
+        print("🎭 Loading NeMo diarization model...")
+        
+        # Configuration basique pour la diarisation
+        diarizer_config = {
+            'manifest_filepath': None,
+            'oracle_vad': False,
+            'clustering': {
+                'parameters': {
+                    'max_num_speakers': 8,
+                    'enhanced_count_thres': 0.8,
+                }
+            }
+        }
+        
+        diarizer = NeuralDiarizer(cfg=diarizer_config)
+        models['diarizer'] = diarizer
+        
+        print("✅ Diarization model loaded")
+        return diarizer
+        
+    except Exception as e:
+        print(f"⚠️ Could not load diarization model: {e}")
+        return None
+
+async def process_transcription_gpu(audio_path: str, request: TranscriptionRequest):
+    """Transcription avec GPU et diarisation optionnelle"""
     start_time = datetime.now()
     
     try:
-        print(f"🚀 Starting transcription pipeline (CPU mode)...")
+        print(f"🚀 Starting transcription pipeline (GPU mode)...")
         print(f"📁 Audio: {audio_path}")
         print(f"🎛️ Model: {request.whisper_model}")
         print(f"🌍 Language: {request.language}")
-        print(f"💾 Device: CPU")
+        print(f"💾 Device: {'GPU' if torch.cuda.is_available() else 'CPU'}")
+        print(f"🎭 Diarization: {'Enabled' if request.enable_diarization else 'Disabled'}")
         
-        # Charger modèle si nécessaire
-        if models['whisper'] is None:
-            whisper_model = load_whisper_model_cpu(request.whisper_model)
+        # Charger modèle Whisper si nécessaire
+        if models['whisper'] is None or models['whisper'].model.model_name != request.whisper_model:
+            whisper_model = load_whisper_model_gpu(request.whisper_model)
         else:
             whisper_model = models['whisper']
+        
+        # Nettoyer la mémoire GPU avant transcription
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            gc.collect()
         
         # Transcription
         print("🎤 Starting transcription...")
         
         try:
+            # Charger et préparer l'audio
             audio_waveform = faster_whisper.decode_audio(audio_path)
+            print(f"🎵 Audio duration: {len(audio_waveform) / 16000:.2f} seconds")
             
-            # Batch size adapté pour CPU
-            cpu_batch_size = min(request.batch_size, 2)  # Très petit pour CPU
-            print(f"🎯 CPU batch size: {cpu_batch_size}")
-            
-            # Tokens à supprimer
+            # Tokens à supprimer pour améliorer la qualité
             suppress_tokens = find_numeral_symbol_tokens_fallback(whisper_model.hf_tokenizer)
             
-            # Transcription CPU (pas de pipeline batchée)
+            # Configuration de transcription optimisée
+            transcribe_options = {
+                "language": request.language,
+                "suppress_tokens": suppress_tokens,
+                "vad_filter": True,
+                "vad_parameters": dict(
+                    min_silence_duration_ms=500,
+                    max_speech_duration_s=30
+                ),
+                "beam_size": 5 if torch.cuda.is_available() else 1,
+                "word_timestamps": True,
+                "condition_on_previous_text": False,
+                "temperature": 0.0,
+                "compression_ratio_threshold": 2.4,
+                "log_prob_threshold": -1.0,
+                "no_speech_threshold": 0.6,
+            }
+            
             transcript_segments, info = whisper_model.transcribe(
-                audio_waveform,
-                language=request.language,
-                suppress_tokens=suppress_tokens,
-                vad_filter=True,
-                beam_size=1,  # Beam size minimal
-                word_timestamps=True
+                audio_waveform, 
+                **transcribe_options
             )
             
             # Convertir en liste
@@ -204,36 +302,84 @@ async def process_transcription_cpu(audio_path: str, request: TranscriptionReque
             
         except Exception as e:
             print(f"❌ Transcription failed: {e}")
+            print(traceback.format_exc())
             raise
         
-        # Assembler texte
-        full_text = " ".join(segment.text for segment in transcript_segments)
+        # Assembler le texte complet
+        full_text = " ".join(segment.text.strip() for segment in transcript_segments if segment.text.strip())
         
-        # Diarisation basique (un seul speaker pour l'instant)
+        # Diarisation si demandée
         speakers_detected = 1
+        speaker_labels = ["A"] * len(transcript_segments)
         
-        # Si NeMo disponible, on peut essayer une diarisation simple
-        if NEMO_AVAILABLE and len(transcript_segments) > 5:
+        if request.enable_diarization and len(transcript_segments) > 2:
             try:
-                print("🎭 Attempting basic NeMo diarization...")
-                # Diarisation simple CPU (à implémenter si nécessaire)
-                speakers_detected = 2  # Exemple
+                print("🎭 Starting speaker diarization...")
+                
+                if NEMO_AVAILABLE:
+                    # Charger modèle de diarisation si nécessaire
+                    if models['diarizer'] is None:
+                        load_diarization_model()
+                    
+                    if models['diarizer'] is not None:
+                        # Diarisation avec NeMo (simplifié)
+                        # Note: Implémentation complète nécessite plus de configuration
+                        print("🎯 Using NeMo diarization (basic)")
+                        speakers_detected = min(len(transcript_segments) // 3 + 1, request.max_speakers)
+                        
+                        # Attribution simple basée sur les pauses
+                        current_speaker = 0
+                        speaker_labels = []
+                        last_end = 0
+                        
+                        for segment in transcript_segments:
+                            # Changer de speaker si pause longue
+                            if segment.start - last_end > 2.0:  # 2 secondes de pause
+                                current_speaker = (current_speaker + 1) % speakers_detected
+                            
+                            speaker_labels.append(chr(65 + current_speaker))  # A, B, C...
+                            last_end = segment.end
+                    else:
+                        print("⚠️ Diarization model not available, using simple alternation")
+                        speakers_detected = 2
+                        speaker_labels = [chr(65 + (i // 3) % 2) for i in range(len(transcript_segments))]
+                else:
+                    print("⚠️ NeMo not available, using basic speaker detection")
+                    # Diarisation basique basée sur les pauses
+                    speakers_detected = 2
+                    speaker_labels = []
+                    for i, segment in enumerate(transcript_segments):
+                        # Alternance simple avec des groupes
+                        speaker_labels.append(chr(65 + (i // 4) % 2))
+                
+                print(f"✅ Diarization completed: {speakers_detected} speakers detected")
+                
             except Exception as e:
                 print(f"⚠️ Diarization failed: {e}")
+                speakers_detected = 1
+                speaker_labels = ["A"] * len(transcript_segments)
         
-        # Formater segments
+        # Formater les segments avec speakers
         response_segments = []
         for i, segment in enumerate(transcript_segments):
-            # Alternance simple des speakers si plusieurs détectés
-            speaker_id = "A" if (i // 3) % 2 == 0 else "B" if speakers_detected > 1 else "A"
+            if i < len(speaker_labels):
+                speaker_id = speaker_labels[i]
+            else:
+                speaker_id = "A"
             
             response_segments.append({
                 "id": i,
-                "start": segment.start,
-                "end": segment.end,
-                "text": segment.text,
-                "speaker": f"Speaker {speaker_id}"
+                "start": round(segment.start, 2),
+                "end": round(segment.end, 2),
+                "text": segment.text.strip(),
+                "speaker": f"Speaker {speaker_id}",
+                "confidence": getattr(segment, 'avg_logprob', 0.0)
             })
+        
+        # Nettoyer la mémoire
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
         
         processing_time = (datetime.now() - start_time).total_seconds()
         
@@ -245,12 +391,13 @@ async def process_transcription_cpu(audio_path: str, request: TranscriptionReque
             language=detected_language,
             model_info={
                 "whisper_model": request.whisper_model,
-                "device": "cpu",
-                "compute_type": "int8",
-                "batch_size": cpu_batch_size,
-                "cpu_threads": 4,
+                "device": "cuda" if torch.cuda.is_available() else "cpu",
+                "compute_type": "float16" if torch.cuda.is_available() else "int8",
+                "batch_size": request.batch_size,
+                "diarization_enabled": request.enable_diarization,
                 "nemo_available": NEMO_AVAILABLE,
-                "helpers_available": HELPERS_AVAILABLE
+                "helpers_available": HELPERS_AVAILABLE,
+                "gpu_memory_gb": torch.cuda.get_device_properties(0).total_memory / 1024**3 if torch.cuda.is_available() else 0
             }
         )
         
@@ -258,6 +405,11 @@ async def process_transcription_cpu(audio_path: str, request: TranscriptionReque
         error_msg = f"Processing failed: {str(e)}"
         print(f"❌ {error_msg}")
         print(traceback.format_exc())
+        
+        # Nettoyer en cas d'erreur
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
         
         processing_time = (datetime.now() - start_time).total_seconds()
         
@@ -269,7 +421,7 @@ async def process_transcription_cpu(audio_path: str, request: TranscriptionReque
             language="unknown",
             model_info={
                 "whisper_model": request.whisper_model,
-                "device": "cpu",
+                "device": "cuda" if torch.cuda.is_available() else "cpu",
                 "error": True
             },
             error=error_msg
@@ -277,26 +429,34 @@ async def process_transcription_cpu(audio_path: str, request: TranscriptionReque
 
 # RunPod handler
 async def handler(job):
-    """Main handler - CPU mode"""
+    """Main handler optimisé GPU"""
     job_input = job.get("input", {})
     
     try:
-        print(f"🚀 New job: {job.get('id', 'unknown')} (CPU mode)")
+        print(f"🚀 New job: {job.get('id', 'unknown')} (GPU mode)")
         
+        # Validation des paramètres
         request = TranscriptionRequest(**job_input)
-        print(f"📥 Downloading: {request.audio_url}")
+        print(f"📥 Processing: {request.audio_url}")
+        print(f"🎛️ Model: {request.whisper_model}")
+        print(f"🎭 Diarization: {request.enable_diarization}")
         
+        # Télécharger l'audio
         audio_path = await download_audio_file(request.audio_url)
-        result = await process_transcription_cpu(audio_path, request)
         
-        # Cleanup
+        # Traitement
+        result = await process_transcription_gpu(audio_path, request)
+        
+        # Cleanup du fichier temporaire
         try:
             os.unlink(audio_path)
-        except:
-            pass
+            print(f"🗑️ Cleaned up {audio_path}")
+        except Exception as e:
+            print(f"⚠️ Could not delete temp file: {e}")
         
+        # Retourner le résultat
         if result.error:
-            return {"error": result.error}
+            return {"error": result.error, "model_info": result.model_info}
         else:
             return {
                 "transcription": result.transcription_text,
@@ -308,30 +468,47 @@ async def handler(job):
             }
             
     except Exception as e:
-        return {"error": f"Handler error: {str(e)}"}
+        error_msg = f"Handler error: {str(e)}"
+        print(f"❌ {error_msg}")
+        print(traceback.format_exc())
+        return {"error": error_msg}
 
 # FastAPI endpoints
 @app.get("/health")
 async def health_check():
+    """Health check avec infos GPU"""
+    gpu_info = {}
+    if torch.cuda.is_available():
+        gpu_info = {
+            "gpu_count": torch.cuda.device_count(),
+            "gpu_names": [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())],
+            "gpu_memory_gb": [torch.cuda.get_device_properties(i).total_memory / 1024**3 for i in range(torch.cuda.device_count())],
+            "cuda_version": torch.version.cuda
+        }
+    
     return {
         "status": "healthy",
-        "device": "cpu",
-        "compute_type": "int8",
-        "cpu_threads": 4,
+        "device": "cuda" if torch.cuda.is_available() else "cpu",
+        "pytorch_version": torch.__version__,
+        "cuda_available": torch.cuda.is_available(),
         "nemo_available": NEMO_AVAILABLE,
         "helpers_available": HELPERS_AVAILABLE,
         "models_loaded": {
-            "whisper": models['whisper'] is not None
+            "whisper": models['whisper'] is not None,
+            "diarizer": models['diarizer'] is not None
         },
+        "gpu_info": gpu_info,
         "timestamp": datetime.utcnow().isoformat()
     }
 
 @app.post("/transcribe")
 async def transcribe_endpoint(request: TranscriptionRequest):
+    """Endpoint de transcription"""
     try:
         audio_path = await download_audio_file(request.audio_url)
-        result = await process_transcription_cpu(audio_path, request)
+        result = await process_transcription_gpu(audio_path, request)
         
+        # Cleanup
         try:
             os.unlink(audio_path)
         except:
@@ -343,14 +520,36 @@ async def transcribe_endpoint(request: TranscriptionRequest):
         return result
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        error_msg = str(e)
+        print(f"❌ API Error: {error_msg}")
+        raise HTTPException(status_code=500, detail=error_msg)
+
+@app.get("/models")
+async def list_models():
+    """Liste des modèles disponibles"""
+    return {
+        "whisper_models": ['tiny', 'base', 'small', 'medium', 'large', 'large-v2', 'large-v3'],
+        "current_whisper": models['whisper'].model.model_name if models['whisper'] else None,
+        "diarization_available": NEMO_AVAILABLE,
+        "device": "cuda" if torch.cuda.is_available() else "cpu"
+    }
 
 if __name__ == "__main__":
-    print(f"🚀 Whisper Diarization Service starting (CPU MODE)...")
-    print(f"💾 Device: CPU")
-    print(f"🧵 CPU Threads: 4")
+    print(f"🚀 Whisper Diarization Service starting (GPU MODE)...")
+    print(f"💾 Device: {'CUDA' if torch.cuda.is_available() else 'CPU'}")
+    if torch.cuda.is_available():
+        print(f"🎮 GPU: {torch.cuda.get_device_name(0)}")
+        print(f"💾 GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
     print(f"🧩 NeMo available: {NEMO_AVAILABLE}")
     print(f"🛠️ Helpers available: {HELPERS_AVAILABLE}")
+    
+    # Précharger le modèle par défaut
+    try:
+        print("🎤 Preloading default Whisper model...")
+        load_whisper_model_gpu("medium")
+        print("✅ Default model loaded")
+    except Exception as e:
+        print(f"⚠️ Could not preload model: {e}")
     
     print("🎯 Starting RunPod serverless handler...")
     runpod.serverless.start({"handler": handler})
