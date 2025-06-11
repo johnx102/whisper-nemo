@@ -1,8 +1,14 @@
+# CRITIQUE: NumPy 1.x obligatoire
+numpy>=1.21.0,<2.0.0
+
+# Core dependencies
 fastapi>=0.104.0
 uvicorn[standard]>=0.24.0
 pydantic>=2.5.0
 aiohttp>=3.9.0
 runpod>=1.6.2
+paramiko
+cryptography
 
 # Audio processing
 faster-whisper>=0.10.0
@@ -10,20 +16,18 @@ librosa>=0.10.1
 soundfile>=0.12.1
 audioread>=3.0.1
 
-# ML/AI Core (will be overridden by CUDA versions in Dockerfile)
+# ML/AI Core - faster-whisper
+faster-whisper>=1.0.0
+ctranslate2>=3.22.0
 torch>=2.1.0
-torchaudio>=2.1.0
 transformers>=4.35.0
-tokenizers>=0.14.0
+tokenizers>=0.15.0
 numpy>=1.24.0
-scipy>=1.11.0
 
-# Optional: Advanced diarization
-# nemo-toolkit[asr]>=1.22.0
-# omegaconf>=2.3.0
-# hydra-core>=1.3.0
-# pyannote.audio>=3.1.0
-# speechbrain>=0.5.15
+# Optional: Advanced diarization (comment/uncomment as needed)
+# nemo-toolkit[asr]
+# omegaconf
+# hydra-core
 
 # Utilities
 python-multipart>=0.0.6
