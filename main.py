@@ -6,10 +6,19 @@ import gc
 import traceback
 import subprocess
 import shutil
+import warnings
 from typing import Optional, Dict, Any
 from datetime import datetime
 from urllib.parse import urlparse
 from pathlib import Path
+
+# Supprimer les warnings Pydantic
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", message=".*Pydantic V1 style.*")
+
+# Configuration mémoire CUDA plus aggressive
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512,garbage_collection_threshold:0.6"
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
 import torch
 import aiohttp
@@ -21,32 +30,69 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, HttpUrl, validator
 import uvicorn
 
-# Import des modules du projet whisper-diarization
-from ctc_forced_aligner import (
-    generate_emissions,
-    get_alignments,
-    get_spans,
-    load_alignment_model,
-    postprocess_results,
-    preprocess_text,
-)
-from deepmultilingualpunctuation import PunctuationModel
-from nemo.collections.asr.models.msdd_models import NeuralDiarizer
+# Configuration cuDNN plus conservative
+if torch.cuda.is_available():
+    torch.backends.cudnn.benchmark = False  # False pour plus de stabilité
+    torch.backends.cuda.matmul.allow_tf32 = False  # False pour éviter les erreurs
+    torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cudnn.deterministic = True  # Pour plus de stabilité
 
-from helpers import (
-    cleanup,
-    create_config,
-    find_numeral_symbol_tokens,
-    get_realigned_ws_mapping_with_punctuation,
-    get_sentences_speaker_mapping,
-    get_speaker_aware_transcript,
-    get_words_speaker_mapping,
-    langs_to_iso,
-    process_language_arg,
-    punct_model_langs,
-    whisper_langs,
-    write_srt,
-)
+# Import des modules du projet whisper-diarization avec fallbacks
+try:
+    from ctc_forced_aligner import (
+        generate_emissions,
+        get_alignments,
+        get_spans,
+        load_alignment_model,
+        postprocess_results,
+        preprocess_text,
+    )
+    CTC_AVAILABLE = True
+    print("✅ CTC forced aligner available")
+except ImportError as e:
+    print(f"⚠️ CTC forced aligner not available: {e}")
+    CTC_AVAILABLE = False
+
+try:
+    from deepmultilingualpunctuation import PunctuationModel
+    PUNCT_AVAILABLE = True
+    print("✅ Punctuation model available")
+except ImportError as e:
+    print(f"⚠️ Punctuation model not available: {e}")
+    PUNCT_AVAILABLE = False
+
+try:
+    from nemo.collections.asr.models.msdd_models import NeuralDiarizer
+    NEMO_AVAILABLE = True
+    print("✅ NeMo available")
+except ImportError as e:
+    print(f"⚠️ NeMo not available: {e}")
+    NEMO_AVAILABLE = False
+
+try:
+    from helpers import (
+        cleanup,
+        create_config,
+        find_numeral_symbol_tokens,
+        get_realigned_ws_mapping_with_punctuation,
+        get_sentences_speaker_mapping,
+        get_speaker_aware_transcript,
+        get_words_speaker_mapping,
+        langs_to_iso,
+        process_language_arg,
+        punct_model_langs,
+        whisper_langs,
+        write_srt,
+    )
+    HELPERS_AVAILABLE = True
+    print("✅ Helpers available")
+except ImportError as e:
+    print(f"⚠️ Helpers not available: {e}")
+    HELPERS_AVAILABLE = False
+    # Définir des fallbacks basiques
+    langs_to_iso = {"fr": "fr", "en": "en", "es": "es", "de": "de"}
+    punct_model_langs = ["fr", "en", "es", "de"]
+    whisper_langs = ["fr", "en", "es", "de"]
 
 # Initialize FastAPI app
 app = FastAPI(title="Whisper Diarization Service", version="1.0.0")
@@ -106,9 +152,43 @@ class TranscriptionResponse(BaseModel):
     srt_content: Optional[str] = None
     error: Optional[str] = None
 
+def cleanup_gpu_memory_aggressive():
+    """Nettoyage GPU très agressif"""
+    try:
+        # Forcer la collecte du garbage collector
+        for _ in range(3):
+            gc.collect()
+        
+        if torch.cuda.is_available():
+            # Vider tous les caches plusieurs fois
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            
+            try:
+                torch.cuda.ipc_collect()  # Nettoie la mémoire IPC
+            except:
+                pass  # Peut ne pas être supporté sur tous les systèmes
+            
+            # Stats détaillées
+            allocated = torch.cuda.memory_allocated() / 1e9
+            cached = torch.cuda.memory_reserved() / 1e9
+            max_allocated = torch.cuda.max_memory_allocated() / 1e9
+            
+            print(f"🧹 GPU Memory: {allocated:.1f}GB allocated, {cached:.1f}GB cached")
+            print(f"🧹 Max allocated: {max_allocated:.1f}GB")
+            
+            # Reset des stats mémoire
+            torch.cuda.reset_peak_memory_stats()
+            
+    except Exception as e:
+        print(f"⚠️ GPU cleanup error: {str(e)}")
+
 def setup_models():
-    """Initialize global models"""
+    """Initialize models with better error handling"""
     global device, compute_type
+    
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    compute_type = mtypes[device]
     
     try:
         print(f"🔧 Setting up models on device: {device}")
@@ -119,13 +199,28 @@ def setup_models():
             print(f"   - Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f}GB")
             print(f"   - CUDA Version: {torch.version.cuda}")
             
-            # Optimisations GPU
-            torch.backends.cudnn.benchmark = True
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
-            torch.cuda.empty_cache()
+            # Vérification cuDNN
+            try:
+                print(f"   - cuDNN enabled: {torch.backends.cudnn.enabled}")
+                print(f"   - cuDNN version: {torch.backends.cudnn.version()}")
+            except Exception as e:
+                print(f"   - cuDNN error: {e}")
+                # Basculer en mode CPU si cuDNN problématique
+                print("   - ⚠️ Switching to CPU mode due to cuDNN issues")
+                device = "cpu"
+                compute_type = "int8"
+            
+            if device == "cuda":
+                # Configuration GPU conservative
+                torch.backends.cudnn.benchmark = False
+                torch.backends.cuda.matmul.allow_tf32 = False
+                torch.backends.cudnn.allow_tf32 = False
+                torch.backends.cudnn.deterministic = True
+                
+                # Nettoyage initial
+                cleanup_gpu_memory_aggressive()
         
-        # Créer répertoires de travail
+        # Créer répertoires
         os.makedirs("temp_outputs", exist_ok=True)
         os.makedirs("outputs", exist_ok=True)
         
@@ -133,6 +228,7 @@ def setup_models():
         
     except Exception as e:
         print(f"❌ Error setting up models: {str(e)}")
+        print("🔄 Falling back to CPU mode")
         return "cpu", "int8"
 
 async def validate_url_security(url: str) -> bool:
@@ -203,21 +299,49 @@ async def download_audio_file(url: str) -> str:
             raise ValueError(f"Download failed: {str(e)}")
 
 def load_whisper_models(model_name: str, device: str, compute_type: str):
-    """Load Whisper models (standard + batched pipeline)"""
+    """Load Whisper models with better memory management"""
     global models
     
     try:
         print(f"🎤 Loading Whisper model: {model_name}")
         
-        # Modèle standard
+        # Nettoyage préventif
+        cleanup_gpu_memory_aggressive()
+        
+        # Configuration de batch size adaptatif selon device
+        if device == "cuda":
+            # Plus conservateur pour éviter les crashes
+            effective_compute_type = "float16"
+            gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1e9
+            if gpu_memory < 20:  # Moins de 20GB
+                effective_compute_type = "int8"  # Plus économe
+                print(f"   - Using int8 for memory efficiency (GPU: {gpu_memory:.1f}GB)")
+            else:
+                print(f"   - Using float16 (GPU: {gpu_memory:.1f}GB)")
+        else:
+            effective_compute_type = "int8"
+            print(f"   - Using int8 on CPU")
+        
+        # Modèle standard avec configuration conservative
         whisper_model = faster_whisper.WhisperModel(
             model_name, 
             device=device, 
-            compute_type=compute_type
+            compute_type=effective_compute_type,
+            cpu_threads=4 if device == "cpu" else 0,
+            num_workers=1  # Limiter le parallélisme
         )
         
-        # Pipeline batchée pour plus de performance
-        whisper_pipeline = faster_whisper.BatchedInferencePipeline(whisper_model)
+        # Pipeline batchée seulement si GPU stable
+        whisper_pipeline = None
+        if device == "cuda":
+            try:
+                whisper_pipeline = faster_whisper.BatchedInferencePipeline(
+                    whisper_model
+                )
+                print(f"   - ✅ Batched pipeline enabled")
+            except Exception as e:
+                print(f"   - ⚠️ Batched pipeline failed: {e}")
+                print(f"   - Continuing with standard model")
         
         models['whisper'] = whisper_model
         models['whisper_pipeline'] = whisper_pipeline
@@ -227,11 +351,17 @@ def load_whisper_models(model_name: str, device: str, compute_type: str):
         
     except Exception as e:
         print(f"❌ Error loading Whisper model: {str(e)}")
+        # Nettoyage en cas d'erreur
+        cleanup_gpu_memory_aggressive()
         raise
 
 def load_alignment_models(language: str, device: str):
     """Load CTC alignment model for the detected language"""
     global models
+    
+    if not CTC_AVAILABLE:
+        print("⚠️ CTC alignment not available")
+        return None
     
     try:
         print(f"🔤 Loading alignment model for language: {language}")
@@ -253,6 +383,10 @@ def load_punctuation_model(language: str):
     """Load punctuation restoration model"""
     global models
     
+    if not PUNCT_AVAILABLE:
+        print("⚠️ Punctuation model not available")
+        return None
+    
     try:
         if language in punct_model_langs:
             print(f"📝 Loading punctuation model for {language}")
@@ -272,11 +406,21 @@ def load_nemo_diarizer():
     """Load NeMo diarization model"""
     global models
     
+    if not NEMO_AVAILABLE:
+        print("⚠️ NeMo not available")
+        return None
+    
     try:
         print(f"🎭 Loading NeMo diarization model...")
         
         # Configuration pour la diarisation
-        config_path = create_config("temp_outputs")
+        if HELPERS_AVAILABLE:
+            config_path = create_config("temp_outputs")
+        else:
+            # Fallback simple
+            config_path = "temp_outputs/diar_infer_general.yaml"
+            os.makedirs("temp_outputs", exist_ok=True)
+            
         nemo_diarizer = NeuralDiarizer(cfg=config_path)
         
         models['nemo_diarizer'] = nemo_diarizer
@@ -322,13 +466,24 @@ def extract_vocals(audio_path: str, no_stem: bool = True) -> str:
         print(f"⚠️ Vocal extraction error: {str(e)}, using original audio")
         return audio_path
 
+def find_numeral_symbol_tokens_fallback(tokenizer):
+    """Fallback pour find_numeral_symbol_tokens si helpers non disponibles"""
+    try:
+        if HELPERS_AVAILABLE:
+            return find_numeral_symbol_tokens(tokenizer)
+        else:
+            # Fallback simple
+            return [-1]  # Pas de suppression de tokens
+    except:
+        return [-1]
+
 async def process_diarization(
     audio_path: str,
     request: TranscriptionRequest,
     device: str,
     compute_type: str
 ) -> TranscriptionResponse:
-    """Main diarization processing pipeline"""
+    """Main diarization processing pipeline with better error handling"""
     
     start_time = datetime.now()
     
@@ -337,178 +492,235 @@ async def process_diarization(
         print(f"📁 Audio file: {audio_path}")
         print(f"🎛️ Model: {request.whisper_model}")
         print(f"🌍 Language: {request.language or 'auto-detect'}")
+        print(f"💾 Device: {device} ({compute_type})")
         
         # 1. Extraction vocale (optionnelle)
         vocal_target = extract_vocals(audio_path, request.no_stem)
         
-        # 2. Charger les modèles Whisper
-        if models['whisper'] is None:
-            whisper_model, whisper_pipeline = load_whisper_models(
-                request.whisper_model, device, compute_type
-            )
-        else:
-            whisper_model = models['whisper']
-            whisper_pipeline = models['whisper_pipeline']
+        # 2. Charger les modèles Whisper avec gestion d'erreur
+        try:
+            if models['whisper'] is None:
+                whisper_model, whisper_pipeline = load_whisper_models(
+                    request.whisper_model, device, compute_type
+                )
+            else:
+                whisper_model = models['whisper']
+                whisper_pipeline = models['whisper_pipeline']
+        except Exception as e:
+            print(f"❌ Whisper loading failed: {e}")
+            # Fallback vers CPU
+            if device == "cuda":
+                print("🔄 Retrying with CPU...")
+                device = "cpu"
+                compute_type = "int8"
+                cleanup_gpu_memory_aggressive()
+                whisper_model, whisper_pipeline = load_whisper_models(
+                    request.whisper_model, device, compute_type
+                )
+            else:
+                raise
         
-        # 3. Transcription
+        # 3. Transcription avec gestion mémoire
         print("🎤 Starting transcription...")
-        audio_waveform = faster_whisper.decode_audio(vocal_target)
         
-        # Gestion des tokens à supprimer
-        suppress_tokens = []
-        if request.suppress_numerals:
-            suppress_tokens = find_numeral_symbol_tokens(whisper_model.hf_tokenizer)
-        else:
-            suppress_tokens = [-1]
+        try:
+            audio_waveform = faster_whisper.decode_audio(vocal_target)
+            
+            # Batch size adaptatif et conservative
+            if device == "cuda":
+                gpu_memory_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+                if gpu_memory_gb >= 40:  # A40/A100
+                    optimal_batch = min(request.batch_size, 16)  # Plus conservateur
+                elif gpu_memory_gb >= 20:  # V100
+                    optimal_batch = min(request.batch_size, 8)
+                else:  # T4 etc
+                    optimal_batch = min(request.batch_size, 4)
+                print(f"🎯 Conservative batch size: {optimal_batch} (GPU: {gpu_memory_gb:.1f}GB)")
+            else:
+                optimal_batch = 4  # CPU très conservateur
+                print(f"🎯 CPU batch size: {optimal_batch}")
+            
+            # Gestion des tokens à supprimer
+            suppress_tokens = find_numeral_symbol_tokens_fallback(whisper_model.hf_tokenizer) if request.suppress_numerals else [-1]
+            
+            # Paramètres de transcription
+            transcribe_params = {
+                'audio': audio_waveform,
+                'batch_size': optimal_batch
+            }
+            
+            if request.language and request.language.lower() != "auto":
+                transcribe_params['language'] = request.language
+            
+            # Utiliser pipeline si disponible, sinon modèle standard
+            if whisper_pipeline and device == "cuda":
+                try:
+                    transcript_segments, info = whisper_pipeline.transcribe(
+                        audio_waveform,
+                        language=request.language,
+                        suppress_tokens=suppress_tokens,
+                        batch_size=optimal_batch,
+                    )
+                    print("✅ Used batched pipeline")
+                except Exception as e:
+                    print(f"⚠️ Batched pipeline failed: {e}, falling back to standard")
+                    transcript_segments, info = whisper_model.transcribe(
+                        audio_waveform,
+                        language=request.language,
+                        suppress_tokens=suppress_tokens,
+                        vad_filter=True,
+                        beam_size=1  # Plus économe
+                    )
+            else:
+                transcript_segments, info = whisper_model.transcribe(
+                    audio_waveform,
+                    language=request.language,
+                    suppress_tokens=suppress_tokens,
+                    vad_filter=True,
+                    beam_size=1  # Plus économe
+                )
+            
+            # Convertir en liste
+            transcript_segments = list(transcript_segments)
+            detected_language = info.language
+            print(f"🌍 Detected language: {detected_language}")
+            
+            # Nettoyage mémoire après transcription
+            cleanup_gpu_memory_aggressive()
+            
+        except Exception as e:
+            print(f"❌ Transcription failed: {e}")
+            cleanup_gpu_memory_aggressive()
+            raise
         
-        # Transcription avec ou sans batch
-        if request.batch_size > 0:
-            transcript_segments, info = whisper_pipeline.transcribe(
-                audio_waveform,
-                language=request.language,
-                suppress_tokens=suppress_tokens,
-                batch_size=request.batch_size,
-            )
-        else:
-            transcript_segments, info = whisper_model.transcribe(
-                audio_waveform,
-                language=request.language,
-                suppress_tokens=suppress_tokens,
-                vad_filter=True,
-            )
-        
-        # Convertir en liste pour manipulation
-        transcript_segments = list(transcript_segments)
-        detected_language = info.language
-        print(f"🌍 Detected language: {detected_language}")
-        
-        # Assembler le texte complet
+        # 4. Assemblage du texte
         full_transcript = "".join(segment.text for segment in transcript_segments)
         print(f"📝 Transcription length: {len(full_transcript)} characters")
         
-        # 4. Alignment temporel
-        print("🔤 Starting forced alignment...")
-        alignment_model = None
-        if models['alignment_model'] is None:
-            alignment_model = load_alignment_models(detected_language, device)
-        else:
-            alignment_model = models['alignment_model']
-        
+        # 5. Alignment temporel (optionnel, peut être désactivé si problématique)
         word_segments = []
-        if alignment_model:
-            try:
-                emissions, stride = generate_emissions(
-                    alignment_model, 
-                    vocal_target, 
-                    batch_size=request.batch_size
-                )
+        try:
+            if CTC_AVAILABLE:
+                print("🔤 Starting forced alignment...")
+                alignment_model = load_alignment_models(detected_language, device)
                 
-                tokens_starred, text_starred = preprocess_text(
-                    full_transcript,
-                    langs_to_iso[detected_language] if detected_language in langs_to_iso else "en",
-                    alignment_model.tokenizer,
-                )
+                if alignment_model:
+                    emissions, stride = generate_emissions(
+                        alignment_model, 
+                        vocal_target, 
+                        batch_size=4  # Très conservateur
+                    )
+                    
+                    tokens_starred, text_starred = preprocess_text(
+                        full_transcript,
+                        langs_to_iso[detected_language] if detected_language in langs_to_iso else "en",
+                        alignment_model.tokenizer,
+                    )
+                    
+                    segments, scores, blank_token = get_alignments(
+                        emissions,
+                        tokens_starred,
+                        stride,
+                        alignment_model.tokenizer,
+                    )
+                    
+                    spans = get_spans(tokens_starred, segments, blank_token)
+                    word_segments = postprocess_results(text_starred, spans, stride, scores)
+                    
+                    print(f"✅ Alignment completed: {len(word_segments)} word segments")
+                    cleanup_gpu_memory_aggressive()
+            else:
+                print("⚠️ CTC alignment skipped (not available)")
                 
-                segments, scores, blank_token = get_alignments(
-                    emissions,
-                    tokens_starred,
-                    stride,
-                    alignment_model.tokenizer,
-                )
-                
-                spans = get_spans(tokens_starred, segments, blank_token)
-                word_segments = postprocess_results(text_starred, spans, stride, scores)
-                
-                print(f"✅ Alignment completed: {len(word_segments)} word segments")
-                
-            except Exception as e:
-                print(f"⚠️ Alignment failed: {str(e)}")
+        except Exception as e:
+            print(f"⚠️ Alignment failed: {e} - continuing without alignment")
+            cleanup_gpu_memory_aggressive()
         
-        # 5. Diarisation avec NeMo
-        print("🎭 Starting speaker diarization...")
-        if models['nemo_diarizer'] is None:
-            nemo_diarizer = load_nemo_diarizer()
-        else:
-            nemo_diarizer = models['nemo_diarizer']
-        
+        # 6. Diarisation avec NeMo (optionnelle si problématique)
         speaker_segments = []
-        speakers_detected = 1  # Défaut
+        speakers_detected = 1
         
-        if nemo_diarizer:
-            try:
-                # Créer le manifest pour NeMo
-                audio_duration = len(audio_waveform) / 16000  # Assuming 16kHz
-                manifest_entry = {
-                    "audio_filepath": vocal_target,
-                    "offset": 0,
-                    "duration": audio_duration,
-                    "label": "infer",
-                    "text": "-",
-                    "rttm_filepath": None,
-                    "uem_filepath": None,
-                }
+        try:
+            if NEMO_AVAILABLE:
+                print("🎭 Starting speaker diarization...")
+                nemo_diarizer = load_nemo_diarizer()
                 
-                manifest_path = "temp_outputs/manifest.json"
-                with open(manifest_path, "w") as f:
-                    json.dump(manifest_entry, f)
-                    f.write("\n")
-                
-                # Exécuter la diarisation
-                nemo_diarizer.diarize()
-                
-                # Lire les résultats RTTM
-                rttm_path = f"temp_outputs/pred_rttms/{Path(vocal_target).stem}.rttm"
-                if os.path.exists(rttm_path):
-                    with open(rttm_path, "r") as f:
-                        for line in f:
-                            parts = line.strip().split()
-                            if len(parts) >= 8 and parts[0] == "SPEAKER":
-                                start_time = float(parts[3])
-                                duration = float(parts[4])
-                                end_time = start_time + duration
-                                speaker_id = parts[7]
-                                
-                                speaker_segments.append({
-                                    "start": start_time,
-                                    "end": end_time,
-                                    "speaker": f"Speaker {speaker_id}",
-                                })
+                if nemo_diarizer:
+                    # Configuration NeMo conservative
+                    audio_duration = len(audio_waveform) / 16000
+                    manifest_entry = {
+                        "audio_filepath": vocal_target,
+                        "offset": 0,
+                        "duration": audio_duration,
+                        "label": "infer",
+                        "text": "-",
+                        "rttm_filepath": None,
+                        "uem_filepath": None,
+                    }
                     
-                    # Compter les speakers uniques
-                    unique_speakers = set(seg["speaker"] for seg in speaker_segments)
-                    speakers_detected = len(unique_speakers)
-                    print(f"✅ Diarization completed: {speakers_detected} speakers detected")
+                    manifest_path = "temp_outputs/manifest.json"
+                    with open(manifest_path, "w") as f:
+                        json.dump(manifest_entry, f)
+                        f.write("\n")
                     
-            except Exception as e:
-                print(f"⚠️ Diarization failed: {str(e)}")
+                    # Exécuter diarisation
+                    nemo_diarizer.diarize()
+                    
+                    # Lire résultats
+                    rttm_path = f"temp_outputs/pred_rttms/{Path(vocal_target).stem}.rttm"
+                    if os.path.exists(rttm_path):
+                        with open(rttm_path, "r") as f:
+                            for line in f:
+                                parts = line.strip().split()
+                                if len(parts) >= 8 and parts[0] == "SPEAKER":
+                                    start_time = float(parts[3])
+                                    duration = float(parts[4])
+                                    end_time = start_time + duration
+                                    speaker_id = parts[7]
+                                    
+                                    speaker_segments.append({
+                                        "start": start_time,
+                                        "end": end_time,
+                                        "speaker": f"Speaker {speaker_id}",
+                                    })
+                        
+                        unique_speakers = set(seg["speaker"] for seg in speaker_segments)
+                        speakers_detected = len(unique_speakers)
+                        print(f"✅ Diarization completed: {speakers_detected} speakers")
+                        cleanup_gpu_memory_aggressive()
+            else:
+                print("⚠️ NeMo diarization skipped (not available)")
+                    
+        except Exception as e:
+            print(f"⚠️ Diarization failed: {e} - continuing with single speaker")
+            cleanup_gpu_memory_aggressive()
         
-        # 6. Restauration de la ponctuation
-        print("📝 Restoring punctuation...")
-        punct_model = None
-        if models['punct_model'] is None:
-            punct_model = load_punctuation_model(detected_language)
-        else:
-            punct_model = models['punct_model']
-        
+        # 7. Restauration de la ponctuation
         punctuated_transcript = full_transcript
-        if punct_model:
-            try:
-                punctuated_transcript = punct_model.restore_punctuation(full_transcript)
-                print("✅ Punctuation restored")
-            except Exception as e:
-                print(f"⚠️ Punctuation restoration failed: {str(e)}")
+        try:
+            if PUNCT_AVAILABLE:
+                print("📝 Restoring punctuation...")
+                punct_model = load_punctuation_model(detected_language)
+                
+                if punct_model:
+                    punctuated_transcript = punct_model.restore_punctuation(full_transcript)
+                    print("✅ Punctuation restored")
+            else:
+                print("⚠️ Punctuation restoration skipped (not available)")
+        except Exception as e:
+            print(f"⚠️ Punctuation restoration failed: {e}")
         
-        # 7. Mapping speakers aux mots et phrases
+        # 8. Mapping speakers aux mots et phrases
         word_speaker_mapping = []
         sentence_speaker_mapping = []
         
-        if word_segments and speaker_segments:
+        if word_segments and speaker_segments and HELPERS_AVAILABLE:
             try:
                 word_speaker_mapping = get_words_speaker_mapping(
                     word_segments, speaker_segments, "Speaker A"
                 )
                 
-                if punct_model:
+                if models.get('punct_model'):
                     word_speaker_mapping = get_realigned_ws_mapping_with_punctuation(
                         word_speaker_mapping, punctuated_transcript, detected_language
                     )
@@ -522,29 +734,31 @@ async def process_diarization(
             except Exception as e:
                 print(f"⚠️ Speaker mapping failed: {str(e)}")
         
-        # 8. Générer la transcription finale avec speakers
-        final_transcript = get_speaker_aware_transcript(
-            sentence_speaker_mapping, punctuated_transcript
-        )
+        # 9. Générer la transcription finale avec speakers
+        final_transcript = punctuated_transcript
+        if HELPERS_AVAILABLE and sentence_speaker_mapping:
+            try:
+                final_transcript = get_speaker_aware_transcript(
+                    sentence_speaker_mapping, punctuated_transcript
+                )
+            except Exception as e:
+                print(f"⚠️ Speaker-aware transcript failed: {e}")
         
-        # 9. Générer le fichier SRT
+        # 10. Générer le fichier SRT
         srt_content = None
         try:
-            srt_path = "temp_outputs/output.srt"
-            write_srt(word_speaker_mapping, srt_path)
-            
-            if os.path.exists(srt_path):
-                with open(srt_path, "r", encoding="utf-8") as f:
-                    srt_content = f.read()
-                print("✅ SRT file generated")
+            if HELPERS_AVAILABLE and word_speaker_mapping:
+                srt_path = "temp_outputs/output.srt"
+                write_srt(word_speaker_mapping, srt_path)
                 
+                if os.path.exists(srt_path):
+                    with open(srt_path, "r", encoding="utf-8") as f:
+                        srt_content = f.read()
+                    print("✅ SRT file generated")
         except Exception as e:
             print(f"⚠️ SRT generation failed: {str(e)}")
         
-        # 10. Préparer la réponse
-        processing_time = (datetime.now() - start_time).total_seconds()
-        
-        # Segments pour la réponse
+        # 11. Préparer les segments pour la réponse
         response_segments = []
         for i, segment in enumerate(transcript_segments):
             seg_dict = {
@@ -552,7 +766,7 @@ async def process_diarization(
                 "start": segment.start,
                 "end": segment.end,
                 "text": segment.text,
-                "speaker": f"Speaker A",  # Défaut si pas de diarisation
+                "speaker": "Speaker A",  # Défaut si pas de diarisation
             }
             
             # Essayer d'assigner le bon speaker
@@ -565,6 +779,11 @@ async def process_diarization(
             
             response_segments.append(seg_dict)
         
+        # IMPORTANT: Nettoyage final agressif
+        cleanup_gpu_memory_aggressive()
+        
+        processing_time = (datetime.now() - start_time).total_seconds()
+        
         return TranscriptionResponse(
             transcription_text=final_transcript,
             segments=response_segments,
@@ -575,11 +794,16 @@ async def process_diarization(
                 "whisper_model": request.whisper_model,
                 "device": device,
                 "compute_type": compute_type,
-                "batch_size": request.batch_size,
+                "batch_size": optimal_batch if 'optimal_batch' in locals() else request.batch_size,
                 "vocal_separation": not request.no_stem,
-                "punctuation_restored": punct_model is not None,
-                "alignment_performed": alignment_model is not None,
+                "punctuation_restored": models.get('punct_model') is not None,
+                "alignment_performed": len(word_segments) > 0,
                 "diarization_performed": len(speaker_segments) > 0,
+                "nemo_available": NEMO_AVAILABLE,
+                "ctc_available": CTC_AVAILABLE,
+                "punct_available": PUNCT_AVAILABLE,
+                "helpers_available": HELPERS_AVAILABLE,
+                "safe_mode": True
             },
             srt_content=srt_content
         )
@@ -588,6 +812,9 @@ async def process_diarization(
         error_msg = f"Processing failed: {str(e)}"
         print(f"❌ {error_msg}")
         print(traceback.format_exc())
+        
+        # Nettoyage en cas d'erreur
+        cleanup_gpu_memory_aggressive()
         
         processing_time = (datetime.now() - start_time).total_seconds()
         
@@ -601,6 +828,11 @@ async def process_diarization(
                 "whisper_model": request.whisper_model,
                 "device": device,
                 "error": True,
+                "nemo_available": NEMO_AVAILABLE,
+                "ctc_available": CTC_AVAILABLE,
+                "punct_available": PUNCT_AVAILABLE,
+                "helpers_available": HELPERS_AVAILABLE,
+                "safe_mode": True
             },
             error=error_msg
         )
@@ -615,10 +847,8 @@ def cleanup_temp_files():
         os.makedirs("temp_outputs", exist_ok=True)
         
         # Nettoyer la mémoire GPU
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            gc.collect()
-            
+        cleanup_gpu_memory_aggressive()
+        
         print("🧹 Temporary files cleaned")
         
     except Exception as e:
@@ -701,12 +931,24 @@ async def health_check():
                 "gpu_memory_total": torch.cuda.get_device_properties(0).total_memory,
                 "gpu_memory_allocated": torch.cuda.memory_allocated(),
                 "gpu_memory_cached": torch.cuda.memory_reserved(),
+                "cudnn_enabled": torch.backends.cudnn.enabled,
             })
+            
+            try:
+                device_info["cudnn_version"] = torch.backends.cudnn.version()
+            except:
+                device_info["cudnn_version"] = "unknown"
         
         return {
             "status": "healthy",
             "timestamp": datetime.utcnow().isoformat(),
             "device_info": device_info,
+            "modules_available": {
+                "nemo": NEMO_AVAILABLE,
+                "ctc_aligner": CTC_AVAILABLE,
+                "punctuation": PUNCT_AVAILABLE,
+                "helpers": HELPERS_AVAILABLE,
+            },
             "models_loaded": {
                 "whisper": models['whisper'] is not None,
                 "whisper_pipeline": models['whisper_pipeline'] is not None,
@@ -719,7 +961,13 @@ async def health_check():
         return {
             "status": "unhealthy",
             "error": str(e),
-            "timestamp": datetime.utcnow().isoformat()
+            "timestamp": datetime.utcnow().isoformat(),
+            "modules_available": {
+                "nemo": NEMO_AVAILABLE,
+                "ctc_aligner": CTC_AVAILABLE,
+                "punctuation": PUNCT_AVAILABLE,
+                "helpers": HELPERS_AVAILABLE,
+            }
         }
 
 @app.post("/transcribe")
@@ -752,11 +1000,67 @@ async def transcribe_endpoint(request: TranscriptionRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
 
+@app.get("/debug")
+async def debug_info():
+    """Debug information endpoint"""
+    try:
+        debug_data = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "modules_available": {
+                "nemo": NEMO_AVAILABLE,
+                "ctc_aligner": CTC_AVAILABLE,
+                "punctuation": PUNCT_AVAILABLE,
+                "helpers": HELPERS_AVAILABLE,
+                "torch": True,
+                "faster_whisper": True,
+                "runpod": True,
+            },
+            "device_info": {
+                "device": device,
+                "compute_type": compute_type,
+                "cuda_available": torch.cuda.is_available(),
+            },
+            "models_loaded": {
+                "whisper": models['whisper'] is not None,
+                "whisper_pipeline": models['whisper_pipeline'] is not None,
+                "alignment_model": models['alignment_model'] is not None,
+                "punct_model": models['punct_model'] is not None,
+                "nemo_diarizer": models['nemo_diarizer'] is not None,
+            }
+        }
+        
+        if torch.cuda.is_available():
+            debug_data["device_info"].update({
+                "gpu_name": torch.cuda.get_device_name(),
+                "gpu_memory_total": torch.cuda.get_device_properties(0).total_memory,
+                "gpu_memory_allocated": torch.cuda.memory_allocated(),
+                "gpu_memory_cached": torch.cuda.memory_reserved(),
+                "cudnn_enabled": torch.backends.cudnn.enabled,
+            })
+            
+            try:
+                debug_data["device_info"]["cudnn_version"] = torch.backends.cudnn.version()
+            except:
+                debug_data["device_info"]["cudnn_version"] = "unknown"
+        
+        return debug_data
+        
+    except Exception as e:
+        return {
+            "error": str(e),
+            "timestamp": datetime.utcnow().isoformat()
+        }
+
 if __name__ == "__main__":
     # Initialiser l'environnement
     device, compute_type = setup_models()
     print(f"🚀 Whisper Diarization Service initialized on {device}")
     print(f"📊 Compute type: {compute_type}")
+    print(f"🧩 Modules available:")
+    print(f"   - NeMo: {'✅' if NEMO_AVAILABLE else '❌'}")
+    print(f"   - CTC Aligner: {'✅' if CTC_AVAILABLE else '❌'}")
+    print(f"   - Punctuation: {'✅' if PUNCT_AVAILABLE else '❌'}")
+    print(f"   - Helpers: {'✅' if HELPERS_AVAILABLE else '❌'}")
     
     # Démarrer le handler RunPod serverless
     print("🎯 Starting RunPod serverless handler...")
