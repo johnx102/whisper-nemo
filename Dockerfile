@@ -1,5 +1,5 @@
 # Dockerfile GPU robuste avec gestion cuDNN
-FROM nvidia/cuda:11.8-cudnn8-devel-ubuntu22.04
+FROM nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
