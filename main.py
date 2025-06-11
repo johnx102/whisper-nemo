@@ -9,16 +9,11 @@ from typing import Optional, Dict, Any
 from datetime import datetime
 from urllib.parse import urlparse
 
-# Supprimer warnings non critiques
-warnings.filterwarnings("ignore", category=UserWarning)
-warnings.filterwarnings("ignore", category=FutureWarning)
+# Supprimer warnings
+warnings.filterwarnings("ignore")
 
-# CONFIGURATION GPU
-os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+# FORCER GPU MODE
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-# Permettre l'utilisation du GPU
-if "CUDA_VISIBLE_DEVICES" in os.environ:
-    del os.environ["CUDA_VISIBLE_DEVICES"]
 
 print("🚀 GPU MODE ENABLED")
 
@@ -27,10 +22,10 @@ import aiohttp
 import runpod
 import faster_whisper
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, HttpUrl, validator
+from pydantic import BaseModel, HttpUrl, field_validator
 import uvicorn
 
-# Vérifier la disponibilité GPU
+# Vérifier que PyTorch fonctionne avec GPU
 print(f"PyTorch version: {torch.__version__}")
 print(f"CUDA available: {torch.cuda.is_available()}")
 print(f"GPU count: {torch.cuda.device_count()}")
@@ -51,13 +46,13 @@ try:
 except ImportError:
     print("⚠️ Helpers not available - using fallbacks")
     HELPERS_AVAILABLE = False
-    langs_to_iso = {"fr": "fr", "en": "en", "es": "es", "de": "de", "it": "it", "pt": "pt"}
-    punct_model_langs = ["fr", "en", "es", "de", "it", "pt"]
+    langs_to_iso = {"fr": "fr", "en": "en", "es": "es", "de": "de"}
+    punct_model_langs = ["fr", "en", "es", "de"]
 
 try:
     from nemo.collections.asr.models.msdd_models import NeuralDiarizer
     NEMO_AVAILABLE = True
-    print("✅ NeMo available for diarization")
+    print("✅ NeMo available")
 except ImportError:
     print("⚠️ NeMo not available - speaker diarization will be basic")
     NEMO_AVAILABLE = False
@@ -73,8 +68,8 @@ SUPPORTED_FORMATS = {
     'audio/ogg', 'audio/flac', 'audio/webm'
 }
 
-# Models storage
-models = {'whisper': None, 'diarizer': None}
+# Models storage avec metadata
+models = {'whisper': None, 'whisper_model_name': None, 'diarizer': None}
 
 class TranscriptionRequest(BaseModel):
     audio_url: HttpUrl
@@ -86,7 +81,8 @@ class TranscriptionRequest(BaseModel):
     min_speakers: Optional[int] = 1
     max_speakers: Optional[int] = 8
     
-    @validator('whisper_model')
+    @field_validator('whisper_model')
+    @classmethod
     def validate_whisper_model(cls, v):
         valid = ['tiny', 'base', 'small', 'medium', 'large', 'large-v2', 'large-v3']
         if v not in valid:
@@ -126,10 +122,6 @@ async def download_audio_file(url: str) -> str:
                 
                 content_type = response.headers.get('content-type', '').lower()
                 print(f"📥 Content-Type: {content_type}")
-                
-                # Vérifier le type de contenu
-                if not any(fmt in content_type for fmt in ['audio', 'video']):
-                    print(f"⚠️ Unexpected content type: {content_type}")
                 
                 content = await response.read()
                 if len(content) > MAX_FILE_SIZE:
@@ -194,6 +186,7 @@ def load_whisper_model_gpu(model_name: str):
         )
         
         models['whisper'] = whisper_model
+        models['whisper_model_name'] = model_name  # Stocker séparément
         
         print(f"✅ Whisper {model_name} loaded successfully ({device}, {compute_type})")
         return whisper_model
@@ -203,38 +196,35 @@ def load_whisper_model_gpu(model_name: str):
         print(traceback.format_exc())
         raise
 
-def load_diarization_model():
-    """Charger le modèle de diarisation si disponible"""
-    global models
+def basic_speaker_diarization(segments, num_speakers=2):
+    """Diarisation basique basée sur les pauses"""
+    if len(segments) <= 2:
+        return ["A"] * len(segments), 1
     
-    if not NEMO_AVAILABLE:
-        print("⚠️ NeMo not available, skipping diarization model")
-        return None
+    # Analyser les pauses entre segments
+    pauses = []
+    for i in range(1, len(segments)):
+        pause = segments[i].start - segments[i-1].end
+        pauses.append(pause)
     
-    try:
-        print("🎭 Loading NeMo diarization model...")
+    # Seuil adaptatif pour changer de speaker
+    avg_pause = sum(pauses) / len(pauses) if pauses else 1.0
+    speaker_change_threshold = max(1.5, avg_pause * 1.5)
+    
+    # Attribution des speakers
+    current_speaker = 0
+    speaker_labels = []
+    
+    for i, segment in enumerate(segments):
+        if i > 0:
+            pause = segment.start - segments[i-1].end
+            if pause > speaker_change_threshold:
+                current_speaker = (current_speaker + 1) % num_speakers
         
-        # Configuration basique pour la diarisation
-        diarizer_config = {
-            'manifest_filepath': None,
-            'oracle_vad': False,
-            'clustering': {
-                'parameters': {
-                    'max_num_speakers': 8,
-                    'enhanced_count_thres': 0.8,
-                }
-            }
-        }
-        
-        diarizer = NeuralDiarizer(cfg=diarizer_config)
-        models['diarizer'] = diarizer
-        
-        print("✅ Diarization model loaded")
-        return diarizer
-        
-    except Exception as e:
-        print(f"⚠️ Could not load diarization model: {e}")
-        return None
+        speaker_labels.append(chr(65 + current_speaker))  # A, B, C...
+    
+    detected_speakers = min(num_speakers, len(set(speaker_labels)))
+    return speaker_labels, detected_speakers
 
 async def process_transcription_gpu(audio_path: str, request: TranscriptionRequest):
     """Transcription avec GPU et diarisation optionnelle"""
@@ -248,8 +238,9 @@ async def process_transcription_gpu(audio_path: str, request: TranscriptionReque
         print(f"💾 Device: {'GPU' if torch.cuda.is_available() else 'CPU'}")
         print(f"🎭 Diarization: {'Enabled' if request.enable_diarization else 'Disabled'}")
         
-        # Charger modèle Whisper si nécessaire
-        if models['whisper'] is None or models['whisper'].model.model_name != request.whisper_model:
+        # Charger modèle Whisper si nécessaire - CORRECTION ICI
+        current_model_name = models.get('whisper_model_name')
+        if models['whisper'] is None or current_model_name != request.whisper_model:
             whisper_model = load_whisper_model_gpu(request.whisper_model)
         else:
             whisper_model = models['whisper']
@@ -317,40 +308,12 @@ async def process_transcription_gpu(audio_path: str, request: TranscriptionReque
                 print("🎭 Starting speaker diarization...")
                 
                 if NEMO_AVAILABLE:
-                    # Charger modèle de diarisation si nécessaire
-                    if models['diarizer'] is None:
-                        load_diarization_model()
-                    
-                    if models['diarizer'] is not None:
-                        # Diarisation avec NeMo (simplifié)
-                        # Note: Implémentation complète nécessite plus de configuration
-                        print("🎯 Using NeMo diarization (basic)")
-                        speakers_detected = min(len(transcript_segments) // 3 + 1, request.max_speakers)
-                        
-                        # Attribution simple basée sur les pauses
-                        current_speaker = 0
-                        speaker_labels = []
-                        last_end = 0
-                        
-                        for segment in transcript_segments:
-                            # Changer de speaker si pause longue
-                            if segment.start - last_end > 2.0:  # 2 secondes de pause
-                                current_speaker = (current_speaker + 1) % speakers_detected
-                            
-                            speaker_labels.append(chr(65 + current_speaker))  # A, B, C...
-                            last_end = segment.end
-                    else:
-                        print("⚠️ Diarization model not available, using simple alternation")
-                        speakers_detected = 2
-                        speaker_labels = [chr(65 + (i // 3) % 2) for i in range(len(transcript_segments))]
+                    # TODO: Implémentation NeMo avancée
+                    print("🔬 Advanced NeMo diarization (TODO)")
+                    speaker_labels, speakers_detected = basic_speaker_diarization(transcript_segments, 3)
                 else:
-                    print("⚠️ NeMo not available, using basic speaker detection")
-                    # Diarisation basique basée sur les pauses
-                    speakers_detected = 2
-                    speaker_labels = []
-                    for i, segment in enumerate(transcript_segments):
-                        # Alternance simple avec des groupes
-                        speaker_labels.append(chr(65 + (i // 4) % 2))
+                    print("🔤 Using basic diarization")
+                    speaker_labels, speakers_detected = basic_speaker_diarization(transcript_segments, 2)
                 
                 print(f"✅ Diarization completed: {speakers_detected} speakers detected")
                 
@@ -362,10 +325,7 @@ async def process_transcription_gpu(audio_path: str, request: TranscriptionReque
         # Formater les segments avec speakers
         response_segments = []
         for i, segment in enumerate(transcript_segments):
-            if i < len(speaker_labels):
-                speaker_id = speaker_labels[i]
-            else:
-                speaker_id = "A"
+            speaker_id = speaker_labels[i] if i < len(speaker_labels) else "A"
             
             response_segments.append({
                 "id": i,
@@ -495,6 +455,7 @@ async def health_check():
         "helpers_available": HELPERS_AVAILABLE,
         "models_loaded": {
             "whisper": models['whisper'] is not None,
+            "current_model": models.get('whisper_model_name'),
             "diarizer": models['diarizer'] is not None
         },
         "gpu_info": gpu_info,
@@ -529,7 +490,7 @@ async def list_models():
     """Liste des modèles disponibles"""
     return {
         "whisper_models": ['tiny', 'base', 'small', 'medium', 'large', 'large-v2', 'large-v3'],
-        "current_whisper": models['whisper'].model.model_name if models['whisper'] else None,
+        "current_whisper": models.get('whisper_model_name'),
         "diarization_available": NEMO_AVAILABLE,
         "device": "cuda" if torch.cuda.is_available() else "cpu"
     }
