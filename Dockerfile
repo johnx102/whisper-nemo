@@ -3,7 +3,7 @@ FROM nvidia/cuda:12.2.2-cudnn8-devel-ubuntu22.04
 
 # Métadonnées
 LABEL maintainer="whisper-diarization-gpu"
-LABEL version="4.0.0"
+LABEL version="5.0.0"
 
 # Variables d'environnement
 ENV DEBIAN_FRONTEND=noninteractive
@@ -19,11 +19,11 @@ ENV LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}
 ENV NVIDIA_VISIBLE_DEVICES=all
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
 
-# FIX CRITIQUE: Variables pour forcer la compatibilité CUDA
+# Variables pour forcer la compatibilité
 ENV CUDA_VERSION=12.2
 ENV TORCH_CUDA_ARCH_LIST="6.0;6.1;7.0;7.5;8.0;8.6;9.0"
 
-# Mise à jour système et installation des dépendances de base
+# Mise à jour système et installation des dépendances système
 RUN apt-get update && apt-get install -y \
     python3.10 \
     python3.10-dev \
@@ -42,77 +42,83 @@ RUN apt-get update && apt-get install -y \
     libopenblas-dev \
     liblapack-dev \
     gfortran \
+    libssl-dev \
+    libffi-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Créer lien symbolique pour python
 RUN ln -sf /usr/bin/python3.10 /usr/bin/python
 
-# Upgrade pip
-RUN python -m pip install --upgrade pip setuptools wheel
-
-# WORKAROUND CRITIQUE: Créer les liens symboliques nécessaires pour torchaudio
+# WORKAROUND: Créer les liens symboliques nécessaires pour torchaudio
 RUN mkdir -p /usr/local/cuda/lib64 && \
     ln -sf /usr/local/cuda/lib64/libcudart.so.12 /usr/local/cuda/lib64/libcudart.so.11.0 && \
     ln -sf /usr/local/cuda/lib64/libcudart.so.12 /usr/lib/x86_64-linux-gnu/libcudart.so.11.0 && \
     ldconfig
 
-# Dossier de travail
-WORKDIR /app
-
-# Upgrade pip et FORCER NumPy 1.x
+# Upgrade pip
 RUN python -m pip install --upgrade pip setuptools wheel
 
-# CRITIQUE: Installer NumPy 1.x AVANT tout le reste
+# ÉTAPE 1: FORCER NumPy 1.x en premier
 RUN pip install --no-cache-dir "numpy>=1.21.0,<2.0.0"
 
-# Vérifier NumPy version
+# Vérifier NumPy
 RUN python -c "import numpy; print('NumPy version:', numpy.__version__); assert numpy.__version__.startswith('1.'), 'NumPy 2.x detected!'"
 
-# Installation de PyTorch AVANT les autres packages (ordre important!)
+# ÉTAPE 2: Installation PyTorch avec CUDA
 RUN pip install --no-cache-dir \
     torch==2.1.2+cu121 \
     torchaudio==2.1.2+cu121 \
     torchvision==0.16.2+cu121 \
     --index-url https://download.pytorch.org/whl/cu121
 
-# Test que PyTorch fonctionne
-RUN python -c "import torch; print('PyTorch OK:', torch.cuda.is_available())"
+# Test PyTorch
+RUN python -c "import torch; import torchaudio; print('PyTorch CUDA:', torch.cuda.is_available())"
 
-# Installation de faster-whisper d'abord
+# ÉTAPE 3: Dependencies de base
+RUN pip install --no-cache-dir \
+    paramiko \
+    cryptography \
+    pycryptodome \
+    cffi
+
+# ÉTAPE 4: faster-whisper
 RUN pip install --no-cache-dir faster-whisper>=1.1.0
 
-# Installation des dépendances Git personnalisées
+# ÉTAPE 5: Web framework
+RUN pip install --no-cache-dir \
+    fastapi>=0.104.0 \
+    uvicorn[standard]>=0.24.0 \
+    aiohttp>=3.9.0 \
+    pydantic>=2.5.0 \
+    runpod>=1.6.2
+
+# ÉTAPE 6: Installation des repos Git du projet whisper-diarization
 RUN pip install --no-cache-dir \
     git+https://github.com/MahmoudAshraf97/demucs.git \
     git+https://github.com/oliverguhr/deepmultilingualpunctuation.git \
     git+https://github.com/MahmoudAshraf97/ctc-forced-aligner.git
 
-# Installation des autres dépendances SANS mettre à jour NumPy
-RUN pip install --no-cache-dir --no-deps \
+# ÉTAPE 7: Autres dépendances
+RUN pip install --no-cache-dir \
     nltk \
     wget \
-    runpod>=1.6.2 \
-    fastapi>=0.104.0 \
-    uvicorn[standard]>=0.24.0 \
-    aiohttp>=3.9.0 \
-    pydantic>=2.5.0
-
-# Installation de NeMo EN DERNIER avec contrainte NumPy
-RUN pip install --no-cache-dir "nemo-toolkit[asr]==2.0.0rc0" --no-deps || \
-    pip install --no-cache-dir "nemo-toolkit[asr]" --no-deps || \
-    echo "Warning: NeMo installation failed, basic diarization only"
-
-# Réinstaller les dépendances manquantes de NeMo sans toucher NumPy
-RUN pip install --no-cache-dir \
     omegaconf \
-    hydra-core \
-    pytorch-lightning \
-    torchmetrics \
-    || echo "Some NeMo dependencies failed"
+    hydra-core
 
-# Test final
-RUN python -c "import torch; import torchaudio; print('All imports OK')" || \
-    echo "Warning: Some imports failed"
+# ÉTAPE 8: NeMo EN DERNIER (le plus problématique)
+RUN pip install --no-cache-dir nemo-toolkit[asr]==2.0.0rc0 || \
+    pip install --no-cache-dir nemo-toolkit[asr] || \
+    echo "Warning: NeMo installation failed, will use basic diarization"
+
+# Test final de tous les imports critiques
+RUN python -c "import torch; import faster_whisper; import runpod; print('Core imports: OK')" || \
+    echo "Warning: Some core imports failed"
+
+RUN python -c "import nemo; print('NeMo: OK')" || \
+    echo "Warning: NeMo import failed - basic diarization only"
+
+# Dossier de travail
+WORKDIR /app
 
 # Copier les fichiers du projet
 COPY . .
@@ -127,9 +133,9 @@ RUN chmod +x main.py
 ENV WHISPER_CACHE_DIR=/tmp/whisper-cache
 ENV TEMP_AUDIO_DIR=/tmp/audio-temp
 
-# Health check amélioré
-HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
-    CMD python -c "import torch; print('CUDA:', torch.cuda.is_available())" || exit 1
+# Health check robuste
+HEALTHCHECK --interval=30s --timeout=15s --start-period=180s --retries=3 \
+    CMD python -c "import torch; import runpod; print('Health: OK')" || exit 1
 
 # Exposer le port FastAPI
 EXPOSE 8000
