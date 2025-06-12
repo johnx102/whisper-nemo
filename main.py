@@ -480,19 +480,42 @@ async def process_transcription_gpu(audio_path: str, request: TranscriptionReque
 
                         def _patched_run_vad(self, manifest_vad_input):
                             from tqdm import tqdm
-                            from nemo.collections.asr.parts.utils.speaker_utils import run_vad
+                            import os
+                            import soundfile as sf
 
+                            vad_outputs = []
                             dataloader = self._vad_model.test_dataloader()
-                            for batch in tqdm(dataloader, desc="vad", leave=True, disable=True):
-                                run_vad(
-                                    batch=batch,
-                                    model=self._vad_model,
-                                    vad_inputs=[],
-                                    output_path=self.vad_out_dir,
-                                    sample_rate=self._cfg.sample_rate,
-                                )
 
-                        # Appliquer le patch sur l’objet clus_diar_model
+                            for batch in tqdm(dataloader, desc="vad", leave=True, disable=True):
+                                inputs, audio_paths, _ = batch
+                                logits = self._vad_model.forward(inputs)
+                                preds = logits.sigmoid().cpu().numpy()
+
+                                for idx, (pred, path) in enumerate(zip(preds, audio_paths)):
+                                    out_path = os.path.join(self.vad_out_dir, os.path.basename(path).replace('.wav', '.rttm'))
+                                    speech_segments = []
+                                    threshold = 0.5
+                                    sr = self._cfg.sample_rate
+                                    frame_shift = 0.01
+
+                                    start = None
+                                    for i, p in enumerate(pred):
+                                        if p >= threshold and start is None:
+                                            start = i * frame_shift
+                                        elif p < threshold and start is not None:
+                                            end = i * frame_shift
+                                            speech_segments.append((start, end - start))
+                                            start = None
+                                    if start is not None:
+                                        end = len(pred) * frame_shift
+                                        speech_segments.append((start, end - start))
+
+                                    with open(out_path, 'w') as fout:
+                                        for seg in speech_segments:
+                                            fout.write(
+                                                f"SPEAKER {path} 1 {seg[0]:.3f} {seg[1]:.3f} <NA> <NA> speaker0 <NA> <NA>\\n"
+                                            )
+
                         diarizer.clustering_embedding.clus_diar_model._run_vad = types.MethodType(
                             _patched_run_vad, diarizer.clustering_embedding.clus_diar_model
                         )
@@ -500,6 +523,7 @@ async def process_transcription_gpu(audio_path: str, request: TranscriptionReque
                         # Lancer la diarisation
                         diarizer.diarize()
                         print("✅ Diarization process completed")
+
 
                         
                         # Lire les résultats RTTM
