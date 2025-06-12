@@ -475,6 +475,7 @@ async def process_transcription_gpu(audio_path: str, request: TranscriptionReque
                         print("✅ NeMo diarizer created, starting diarization...")
                         
                         # Lancer la diarisation
+                        diarizer.verbose = True
                         diarizer.diarize()
                         print("✅ Diarization process completed")
                         
