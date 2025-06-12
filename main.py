@@ -50,11 +50,22 @@ except ImportError:
     punct_model_langs = ["fr", "en", "es", "de"]
 
 try:
+    print("🔍 Testing NeMo import...")
+    import nemo
+    print(f"📦 NeMo version: {nemo.__version__}")
+    
     from nemo.collections.asr.models.msdd_models import NeuralDiarizer
+    print("✅ NeuralDiarizer imported successfully")
+    
     NEMO_AVAILABLE = True
     print("✅ NeMo available")
-except ImportError:
-    print("⚠️ NeMo not available - speaker diarization will be basic")
+except ImportError as e:
+    print(f"❌ NeMo import failed: {e}")
+    print(f"❌ Error type: {type(e).__name__}")
+    NEMO_AVAILABLE = False
+except Exception as e:
+    print(f"❌ NeMo unexpected error: {e}")
+    print(f"❌ Error type: {type(e).__name__}")
     NEMO_AVAILABLE = False
 
 # Initialize FastAPI
@@ -196,10 +207,13 @@ def load_whisper_model_gpu(model_name: str):
         print(traceback.format_exc())
         raise
 
-def basic_speaker_diarization(segments, num_speakers=2):
-    """Diarisation basique basée sur les pauses"""
+def basic_speaker_diarization(segments, max_speakers=2):
+    """Diarisation basique basée sur les pauses - UTILISE max_speakers"""
     if len(segments) <= 2:
         return ["A"] * len(segments), 1
+    
+    # Utiliser le paramètre max_speakers
+    num_speakers = min(max_speakers, max(2, len(segments) // 5))
     
     # Analyser les pauses entre segments
     pauses = []
@@ -209,7 +223,7 @@ def basic_speaker_diarization(segments, num_speakers=2):
     
     # Seuil adaptatif pour changer de speaker
     avg_pause = sum(pauses) / len(pauses) if pauses else 1.0
-    speaker_change_threshold = max(1.5, avg_pause * 1.5)
+    speaker_change_threshold = max(1.0, avg_pause * 1.2)
     
     # Attribution des speakers
     current_speaker = 0
@@ -308,17 +322,106 @@ async def process_transcription_gpu(audio_path: str, request: TranscriptionReque
                 print("🎭 Starting speaker diarization...")
                 
                 if NEMO_AVAILABLE:
-                    # TODO: Implémentation NeMo avancée
-                    print("🔬 Advanced NeMo diarization (TODO)")
-                    speaker_labels, speakers_detected = basic_speaker_diarization(transcript_segments, 3)
+                    print(f"🎯 Using NeMo MSDD with {request.min_speakers}-{request.max_speakers} speakers")
+                    
+                    # Configuration NeMo diarisation
+                    from helpers import create_config
+                    
+                    # Créer config temporaire pour NeMo
+                    temp_manifest = f"/tmp/temp_manifest_{hash(audio_path)}.json"
+                    temp_config_path = f"/tmp/temp_config_{hash(audio_path)}.yaml"
+                    
+                    # Créer manifest pour NeMo
+                    manifest_entry = {
+                        "audio_filepath": audio_path,
+                        "offset": 0,
+                        "duration": len(audio_waveform) / 16000,
+                        "label": "infer",
+                        "text": "-",
+                        "num_speakers": None,
+                        "rttm_filepath": None,
+                        "uem_filepath": None
+                    }
+                    
+                    with open(temp_manifest, 'w') as f:
+                        f.write(json.dumps(manifest_entry) + '\n')
+                    
+                    # Créer config NeMo
+                    create_config(temp_config_path)
+                    
+                    # Charger et configurer le modèle NeMo
+                    if models['diarizer'] is None:
+                        from omegaconf import OmegaConf
+                        cfg = OmegaConf.load(temp_config_path)
+                        cfg.diarizer.manifest_filepath = temp_manifest
+                        cfg.diarizer.out_dir = '/tmp/'
+                        cfg.diarizer.clustering.parameters.min_num_speakers = request.min_speakers
+                        cfg.diarizer.clustering.parameters.max_num_speakers = request.max_speakers
+                        
+                        models['diarizer'] = NeuralDiarizer(cfg=cfg)
+                        print(f"✅ NeMo diarizer loaded with {request.min_speakers}-{request.max_speakers} speakers")
+                    
+                    # Lancer la diarisation NeMo
+                    models['diarizer'].diarize()
+                    
+                    # Récupérer les résultats
+                    speaker_ts = []
+                    pred_rttm = f'/tmp/pred_rttms/{os.path.basename(audio_path).replace(".wav", ".rttm")}'
+                    if os.path.exists(pred_rttm):
+                        with open(pred_rttm, 'r') as f:
+                            for line in f:
+                                parts = line.strip().split()
+                                if len(parts) >= 8:
+                                    start_time = float(parts[3])
+                                    duration = float(parts[4])
+                                    speaker_id = parts[7]
+                                    speaker_ts.append({
+                                        'start': start_time,
+                                        'end': start_time + duration,
+                                        'speaker': speaker_id
+                                    })
+                    
+                    # Mapper les segments Whisper aux speakers NeMo
+                    if speaker_ts:
+                        speaker_labels = []
+                        speakers_detected = len(set(ts['speaker'] for ts in speaker_ts))
+                        
+                        for segment in transcript_segments:
+                            segment_start = segment.start
+                            segment_end = segment.end
+                            segment_mid = (segment_start + segment_end) / 2
+                            
+                            # Trouver le speaker pour ce segment
+                            assigned_speaker = "A"  # défaut
+                            for ts in speaker_ts:
+                                if ts['start'] <= segment_mid <= ts['end']:
+                                    # Mapper speaker_id vers lettre (0->A, 1->B, etc.)
+                                    speaker_num = int(ts['speaker'].split('_')[-1]) if '_' in ts['speaker'] else 0
+                                    assigned_speaker = chr(65 + speaker_num % 26)
+                                    break
+                            
+                            speaker_labels.append(assigned_speaker)
+                        
+                        # Cleanup fichiers temporaires
+                        try:
+                            os.unlink(temp_manifest)
+                            os.unlink(temp_config_path)
+                            if os.path.exists(pred_rttm):
+                                os.unlink(pred_rttm)
+                        except:
+                            pass
+                        
+                        print(f"✅ NeMo diarization completed: {speakers_detected} speakers detected")
+                    else:
+                        print("⚠️ NeMo diarization failed, using basic method")
+                        speaker_labels, speakers_detected = basic_speaker_diarization(transcript_segments, request.max_speakers)
                 else:
                     print("🔤 Using basic diarization")
-                    speaker_labels, speakers_detected = basic_speaker_diarization(transcript_segments, 2)
-                
-                print(f"✅ Diarization completed: {speakers_detected} speakers detected")
+                    speaker_labels, speakers_detected = basic_speaker_diarization(transcript_segments, request.max_speakers)
                 
             except Exception as e:
                 print(f"⚠️ Diarization failed: {e}")
+                print(traceback.format_exc())
                 speakers_detected = 1
                 speaker_labels = ["A"] * len(transcript_segments)
         
@@ -485,8 +588,34 @@ async def transcribe_endpoint(request: TranscriptionRequest):
         print(f"❌ API Error: {error_msg}")
         raise HTTPException(status_code=500, detail=error_msg)
 
-@app.get("/models")
-async def list_models():
+@app.get("/debug/nemo")
+async def debug_nemo():
+    """Debug NeMo availability"""
+    try:
+        import nemo
+        nemo_version = nemo.__version__
+        
+        try:
+            from nemo.collections.asr.models.msdd_models import NeuralDiarizer
+            msdd_available = True
+            msdd_error = None
+        except Exception as e:
+            msdd_available = False
+            msdd_error = str(e)
+        
+        return {
+            "nemo_installed": True,
+            "nemo_version": nemo_version,
+            "msdd_available": msdd_available,
+            "msdd_error": msdd_error,
+            "nemo_available": NEMO_AVAILABLE
+        }
+    except Exception as e:
+        return {
+            "nemo_installed": False,
+            "error": str(e),
+            "nemo_available": NEMO_AVAILABLE
+        }
     """Liste des modèles disponibles"""
     return {
         "whisper_models": ['tiny', 'base', 'small', 'medium', 'large', 'large-v2', 'large-v3'],
