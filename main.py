@@ -49,52 +49,6 @@ except ImportError:
     HELPERS_AVAILABLE = False
     langs_to_iso = {"fr": "fr", "en": "en", "es": "es", "de": "de"}
     punct_model_langs = ["fr", "en", "es", "de"]
-    
-    # Fallback create_config si pas disponible
-    def create_config(config_path):
-        """Fallback create_config function"""
-        config_content = """
-diarizer:
-  out_dir: /tmp/nemo_outputs
-  oracle_vad: false
-  clustering:
-    parameters:
-      oracle_num_speakers: false
-      max_num_speakers: 8
-      enhanced_count_thres: 0.8
-  msdd_model:
-    model_path: diar_msdd_telephonic
-    parameters:
-      use_speaker_model_from_ckpt: true
-      infer_batch_size: 25
-      sigmoid_threshold: [0.7]
-      seq_eval_mode: false
-      split_infer: true
-      diar_window_length: 50
-      overlap_infer_spk_limit: 5
-  vad:
-    model_path: vad_multilingual_marblenet
-    external_vad_manifest: null
-    parameters:
-      onset: 0.8
-      offset: 0.6
-      pad_onset: 0.05
-      pad_offset: -0.05
-      min_duration_on: 0.2
-      min_duration_off: 0.2
-  speaker_embeddings:
-    model_path: titanet_large
-    parameters:
-      window_length_in_sec: 1.5
-      shift_length_in_sec: 0.75
-      multiscale_weights: [1, 1, 1, 1, 1]
-      multiscale_args:
-        scale_dict: "{1: [1.5], 2: [1.5, 1.0], 3: [1.5, 1.0, 0.5]}"
-
-device: cuda
-"""
-        with open(config_path, 'w') as f:
-            f.write(config_content)
 
 try:
     print("🔍 Testing PyAnnote import...")
@@ -125,7 +79,7 @@ except Exception as e:
     NEMO_AVAILABLE = False
 
 # Initialize FastAPI
-app = FastAPI(title="Whisper Diarization Service (GPU)", version="4.0.0")
+app = FastAPI(title="Whisper Diarization Service (GPU)", version="4.1.0")
 
 # Configuration
 MAX_FILE_SIZE = 500 * 1024 * 1024  # 500MB
@@ -140,9 +94,9 @@ models = {'whisper': None, 'whisper_model_name': None, 'diarizer': None}
 
 class TranscriptionRequest(BaseModel):
     audio_url: HttpUrl
-    whisper_model: Optional[str] = "medium"  # Meilleur modèle par défaut avec GPU
+    whisper_model: Optional[str] = "medium"
     language: Optional[str] = "fr"
-    batch_size: Optional[int] = 16  # Plus gros batch avec GPU
+    batch_size: Optional[int] = 16
     no_stem: Optional[bool] = True
     enable_diarization: Optional[bool] = True
     min_speakers: Optional[int] = 1
@@ -253,7 +207,7 @@ def load_whisper_model_gpu(model_name: str):
         )
         
         models['whisper'] = whisper_model
-        models['whisper_model_name'] = model_name  # Stocker séparément
+        models['whisper_model_name'] = model_name
         
         print(f"✅ Whisper {model_name} loaded successfully ({device}, {compute_type})")
         return whisper_model
@@ -264,7 +218,7 @@ def load_whisper_model_gpu(model_name: str):
         raise
 
 def basic_speaker_diarization(segments, max_speakers=2):
-    """Diarisation basique basée sur les pauses - UTILISE max_speakers"""
+    """Diarisation basique basée sur les pauses"""
     if len(segments) <= 2:
         return ["A"] * len(segments), 1
     
@@ -296,6 +250,60 @@ def basic_speaker_diarization(segments, max_speakers=2):
     detected_speakers = min(num_speakers, len(set(speaker_labels)))
     return speaker_labels, detected_speakers
 
+def create_nemo_config(audio_path: str, temp_dir: str, max_speakers: int = 8):
+    """Créer une configuration NeMo correcte"""
+    
+    # CORRECTION PRINCIPALE : Configuration YAML correcte avec dictionnaire Python
+    config_content = f"""device: cuda
+
+diarizer:
+  out_dir: {temp_dir}
+  oracle_vad: false
+  clustering:
+    parameters:
+      oracle_num_speakers: false
+      max_num_speakers: {max_speakers}
+      enhanced_count_thres: 0.8
+  msdd_model:
+    model_path: diar_msdd_telephonic
+    parameters:
+      use_speaker_model_from_ckpt: true
+      infer_batch_size: 25
+      sigmoid_threshold: [0.7]
+      seq_eval_mode: false
+      split_infer: true
+      diar_window_length: 50
+      overlap_infer_spk_limit: 5
+  vad:
+    model_path: vad_multilingual_marblenet
+    external_vad_manifest: null
+    parameters:
+      onset: 0.8
+      offset: 0.6
+      pad_onset: 0.05
+      pad_offset: -0.05
+      min_duration_on: 0.2
+      min_duration_off: 0.2
+  speaker_embeddings:
+    model_path: titanet_large
+    parameters:
+      window_length_in_sec: [1.5]
+      shift_length_in_sec: [0.75]
+      multiscale_weights: [1, 1, 1, 1, 1]
+      multiscale_args:
+        scale_dict:
+          1: [1.5]
+          2: [1.5, 1.0]
+          3: [1.5, 1.0, 0.5]
+"""
+    
+    config_path = os.path.join(temp_dir, 'config.yaml')
+    with open(config_path, 'w') as f:
+        f.write(config_content)
+    
+    print(f"✅ NeMo config created: {config_path}")
+    return config_path
+
 async def process_transcription_gpu(audio_path: str, request: TranscriptionRequest):
     """Transcription avec GPU et diarisation optionnelle"""
     start_time = datetime.now()
@@ -308,7 +316,7 @@ async def process_transcription_gpu(audio_path: str, request: TranscriptionReque
         print(f"💾 Device: {'GPU' if torch.cuda.is_available() else 'CPU'}")
         print(f"🎭 Diarization: {'Enabled' if request.enable_diarization else 'Disabled'}")
         
-        # Charger modèle Whisper si nécessaire - CORRECTION ICI
+        # Charger modèle Whisper si nécessaire
         current_model_name = models.get('whisper_model_name')
         if models['whisper'] is None or current_model_name != request.whisper_model:
             whisper_model = load_whisper_model_gpu(request.whisper_model)
@@ -421,75 +429,20 @@ async def process_transcription_gpu(audio_path: str, request: TranscriptionReque
                     print(f"🎯 Using NeMo MSDD with {request.min_speakers}-{request.max_speakers} speakers")
                     
                     try:
-                        # WORKAROUND: Désactiver la vérification stricte cuDNN pour NeMo
-                        import os
-                        os.environ["TORCH_CUDNN_V8_API_DISABLED"] = "1"
-                        os.environ["CUDNN_VERSION"] = "9.0.0"  # Force la version détectée
-                        
-                        # Créer config directement sans utiliser create_config()
-                        temp_dir = '/tmp/nemo_temp'
+                        # Créer répertoire temporaire
+                        temp_dir = f'/tmp/nemo_temp_{hash(audio_path)}'
                         os.makedirs(temp_dir, exist_ok=True)
-                        temp_config_path = os.path.join(temp_dir, f'config_{hash(audio_path)}.yaml')
                         
-                        # Écrire directement le fichier YAML de config
-                        config_yaml = f"""
-device: cuda
-
-diarizer:
-  out_dir: {temp_dir}
-  oracle_vad: false
-  clustering:
-    parameters:
-      oracle_num_speakers: false
-      max_num_speakers: {request.max_speakers}
-      enhanced_count_thres: 0.8
-  msdd_model:
-    model_path: diar_msdd_telephonic
-    parameters:
-      use_speaker_model_from_ckpt: true
-      infer_batch_size: 25
-      sigmoid_threshold: [0.7]
-      seq_eval_mode: false
-      split_infer: true
-      diar_window_length: 50
-      overlap_infer_spk_limit: 5
-  vad:
-    model_path: vad_multilingual_marblenet
-    external_vad_manifest: null
-    parameters:
-      onset: 0.8
-      offset: 0.6
-      pad_onset: 0.05
-      pad_offset: -0.05
-      min_duration_on: 0.2
-      min_duration_off: 0.2
-  speaker_embeddings:
-    model_path: titanet_large
-    parameters:
-      window_length_in_sec: 1.5
-      shift_length_in_sec: 0.75
-      multiscale_weights: [1, 1, 1, 1, 1]
-      multiscale_args:
-        scale_dict: "{{1: [1.5], 2: [1.5, 1.0], 3: [1.5, 1.0, 0.5]}}"
-"""
+                        # Créer config NeMo corrigée
+                        config_path = create_nemo_config(audio_path, temp_dir, request.max_speakers)
                         
-                        with open(temp_config_path, 'w') as f:
-                            f.write(config_yaml)
-                        print(f"✅ Config file written to {temp_config_path}")
-                        
-                        # Vérifier que c'est bien un fichier
-                        if os.path.isfile(temp_config_path):
-                            print(f"✅ Confirmed: {temp_config_path} is a file")
-                        else:
-                            raise Exception(f"ERROR: {temp_config_path} is not a file!")
-                        
-                        # Charger la config
+                        # Charger la config avec OmegaConf
                         from omegaconf import OmegaConf
-                        cfg = OmegaConf.load(temp_config_path)
+                        cfg = OmegaConf.load(config_path)
                         print("✅ Config loaded successfully")
                         
                         # Créer manifest temporaire
-                        temp_manifest = os.path.join(temp_dir, f'manifest_{hash(audio_path)}.json')
+                        temp_manifest = os.path.join(temp_dir, 'manifest.json')
                         manifest_entry = {
                             "audio_filepath": audio_path,
                             "offset": 0,
@@ -511,6 +464,7 @@ diarizer:
                         print(f"🎯 Max speakers: {cfg.diarizer.clustering.parameters.max_num_speakers}")
                         
                         # Créer le diarizer
+                        print("🏗️ Creating NeMo diarizer...")
                         diarizer = NeuralDiarizer(cfg=cfg)
                         print("✅ NeMo diarizer created, starting diarization...")
                         
@@ -524,23 +478,6 @@ diarizer:
                         pred_rttm = os.path.join(pred_rttm_dir, f'{audio_basename}.rttm')
                         
                         print(f"🔍 Looking for RTTM: {pred_rttm}")
-                        
-                        # Debug: lister tous les fichiers générés
-                        try:
-                            if os.path.exists(pred_rttm_dir):
-                                files = os.listdir(pred_rttm_dir)
-                                print(f"📁 Files in pred_rttms: {files}")
-                            else:
-                                print(f"📁 pred_rttms directory not found")
-                                # Lister le contenu du temp_dir
-                                if os.path.exists(temp_dir):
-                                    all_files = []
-                                    for root, dirs, files in os.walk(temp_dir):
-                                        for file in files:
-                                            all_files.append(os.path.join(root, file))
-                                    print(f"📁 All files in temp_dir: {all_files}")
-                        except Exception as e:
-                            print(f"⚠️ Error listing files: {e}")
                         
                         speaker_labels = []
                         speakers_detected = 1
@@ -805,11 +742,14 @@ async def debug_nemo():
             "error": str(e),
             "nemo_available": NEMO_AVAILABLE
         }
+
+@app.get("/models")
+async def list_models():
     """Liste des modèles disponibles"""
     return {
         "whisper_models": ['tiny', 'base', 'small', 'medium', 'large', 'large-v2', 'large-v3'],
         "current_whisper": models.get('whisper_model_name'),
-        "diarization_available": NEMO_AVAILABLE,
+        "diarization_available": NEMO_AVAILABLE or PYANNOTE_AVAILABLE,
         "device": "cuda" if torch.cuda.is_available() else "cpu"
     }
 
@@ -820,6 +760,7 @@ if __name__ == "__main__":
         print(f"🎮 GPU: {torch.cuda.get_device_name(0)}")
         print(f"💾 GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
     print(f"🧩 NeMo available: {NEMO_AVAILABLE}")
+    print(f"🎤 PyAnnote available: {PYANNOTE_AVAILABLE}")
     print(f"🛠️ Helpers available: {HELPERS_AVAILABLE}")
     
     # Précharger le modèle par défaut
