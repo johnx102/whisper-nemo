@@ -50,8 +50,11 @@ RUN pip install --no-cache-dir \
 # 1. Cloner le repo original et installer manuellement pour éviter conflits PyTorch
 RUN git clone https://github.com/MahmoudAshraf97/whisper-diarization.git /tmp/whisper-diarization
 
-# 2. Installer les dépendances une par une pour éviter les conflits
+# 2. Installer les dépendances avec versions spécifiques pour compatibilité
 RUN pip install --no-cache-dir \
+    "huggingface_hub==0.20.3" \
+    "transformers==4.37.2" \
+    "tokenizers==0.15.2" \
     faster-whisper>=1.1.0 \
     nltk \
     wget \
