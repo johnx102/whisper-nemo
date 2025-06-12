@@ -40,6 +40,7 @@ try:
         find_numeral_symbol_tokens,
         langs_to_iso,
         punct_model_langs,
+        create_config,
     )
     HELPERS_AVAILABLE = True
     print("✅ Helpers available")
@@ -48,6 +49,52 @@ except ImportError:
     HELPERS_AVAILABLE = False
     langs_to_iso = {"fr": "fr", "en": "en", "es": "es", "de": "de"}
     punct_model_langs = ["fr", "en", "es", "de"]
+    
+    # Fallback create_config si pas disponible
+    def create_config(config_path):
+        """Fallback create_config function"""
+        config_content = """
+diarizer:
+  out_dir: /tmp/nemo_outputs
+  oracle_vad: false
+  clustering:
+    parameters:
+      oracle_num_speakers: false
+      max_num_speakers: 8
+      enhanced_count_thres: 0.8
+  msdd_model:
+    model_path: diar_msdd_telephonic
+    parameters:
+      use_speaker_model_from_ckpt: true
+      infer_batch_size: 25
+      sigmoid_threshold: [0.7]
+      seq_eval_mode: false
+      split_infer: true
+      diar_window_length: 50
+      overlap_infer_spk_limit: 5
+  vad:
+    model_path: vad_multilingual_marblenet
+    external_vad_manifest: null
+    parameters:
+      onset: 0.8
+      offset: 0.6
+      pad_onset: 0.05
+      pad_offset: -0.05
+      min_duration_on: 0.2
+      min_duration_off: 0.2
+  speaker_embeddings:
+    model_path: titanet_large
+    parameters:
+      window_length_in_sec: 1.5
+      shift_length_in_sec: 0.75
+      multiscale_weights: [1, 1, 1, 1, 1]
+      multiscale_args:
+        scale_dict: "{1: [1.5], 2: [1.5, 1.0], 3: [1.5, 1.0, 0.5]}"
+
+device: cuda
+"""
+        with open(config_path, 'w') as f:
+            f.write(config_content)
 
 try:
     print("🔍 Testing PyAnnote import...")
