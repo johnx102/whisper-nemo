@@ -374,63 +374,21 @@ async def process_transcription_gpu(audio_path: str, request: TranscriptionReque
                     print(f"🎯 Using NeMo MSDD with {request.min_speakers}-{request.max_speakers} speakers")
                     
                     try:
-                        # Configuration NeMo diarisation simplifiée
-                        from omegaconf import OmegaConf
-                        
-                        # Créer config NeMo complète
-                        cfg = OmegaConf.create({
-                            'diarizer': {
-                                'manifest_filepath': None,
-                                'out_dir': '/tmp/nemo_outputs',
-                                'oracle_vad': False,
-                                'clustering': {
-                                    'parameters': {
-                                        'oracle_num_speakers': False,
-                                        'max_num_speakers': request.max_speakers,
-                                        'enhanced_count_thres': 0.8,
-                                    }
-                                },
-                                'msdd_model': {
-                                    'model_path': 'diar_msdd_telephonic',
-                                    'parameters': {
-                                        'use_speaker_model_from_ckpt': True,
-                                        'infer_batch_size': 25,
-                                        'sigmoid_threshold': [0.7],
-                                        'seq_eval_mode': False,
-                                        'split_infer': True,
-                                        'diar_window_length': 50,
-                                        'overlap_infer_spk_limit': 5,
-                                    }
-                                },
-                                'vad': {
-                                    'model_path': 'vad_multilingual_marblenet',
-                                    'external_vad_manifest': None,
-                                    'parameters': {
-                                        'onset': 0.8,
-                                        'offset': 0.6,
-                                        'pad_onset': 0.05,
-                                        'pad_offset': -0.05,
-                                        'min_duration_on': 0.2,
-                                        'min_duration_off': 0.2
-                                    }
-                                },
-                                'speaker_embeddings': {
-                                    'model_path': 'titanet_large',
-                                    'parameters': {
-                                        'window_length_in_sec': 1.5,
-                                        'shift_length_in_sec': 0.75,
-                                        'multiscale_weights': [1, 1, 1, 1, 1],
-                                        'multiscale_args': {"scale_dict": "{1: [1.5], 2: [1.5, 1.0], 3: [1.5, 1.0, 0.5]}"}
-                                    }
-                                }
-                            }
-                        })
-                        
-                        # Créer manifest temporaire
+                        # Utiliser la vraie fonction create_config du projet original
                         temp_dir = '/tmp/nemo_temp'
                         os.makedirs(temp_dir, exist_ok=True)
-                        temp_manifest = os.path.join(temp_dir, f'manifest_{hash(audio_path)}.json')
+                        temp_config_path = os.path.join(temp_dir, f'config_{hash(audio_path)}.yaml')
                         
+                        # Créer le config avec la vraie fonction
+                        create_config(temp_config_path)
+                        print(f"✅ Config created at {temp_config_path}")
+                        
+                        # Charger et modifier la config
+                        from omegaconf import OmegaConf
+                        cfg = OmegaConf.load(temp_config_path)
+                        
+                        # Créer manifest temporaire
+                        temp_manifest = os.path.join(temp_dir, f'manifest_{hash(audio_path)}.json')
                         manifest_entry = {
                             "audio_filepath": audio_path,
                             "offset": 0,
@@ -445,9 +403,15 @@ async def process_transcription_gpu(audio_path: str, request: TranscriptionReque
                         with open(temp_manifest, 'w') as f:
                             f.write(json.dumps(manifest_entry) + '\n')
                         
-                        # Configurer les chemins
+                        # Configurer les chemins et paramètres
                         cfg.diarizer.manifest_filepath = temp_manifest
                         cfg.diarizer.out_dir = temp_dir
+                        
+                        # Forcer les paramètres de speakers
+                        if hasattr(cfg.diarizer, 'clustering') and hasattr(cfg.diarizer.clustering, 'parameters'):
+                            cfg.diarizer.clustering.parameters.max_num_speakers = request.max_speakers
+                            cfg.diarizer.clustering.parameters.enhanced_count_thres = 0.8
+                            print(f"🎯 Set max_speakers to {request.max_speakers}")
                         
                         # Créer le diarizer
                         diarizer = NeuralDiarizer(cfg=cfg)
@@ -488,8 +452,10 @@ async def process_transcription_gpu(audio_path: str, request: TranscriptionReque
                                     
                                     for ts in speaker_ts:
                                         if ts['start'] <= segment_mid <= ts['end']:
-                                            speaker_num = hash(ts['speaker']) % 26
-                                            assigned_speaker = chr(65 + speaker_num)
+                                            # Mapper de façon consistante
+                                            speaker_list = sorted(list(set(t['speaker'] for t in speaker_ts)))
+                                            speaker_index = speaker_list.index(ts['speaker'])
+                                            assigned_speaker = chr(65 + speaker_index)
                                             break
                                     
                                     speaker_labels.append(assigned_speaker)
@@ -498,6 +464,16 @@ async def process_transcription_gpu(audio_path: str, request: TranscriptionReque
                                 speaker_labels, speakers_detected = basic_speaker_diarization(transcript_segments, request.max_speakers)
                         else:
                             print(f"⚠️ RTTM file not found: {pred_rttm}")
+                            # Lister les fichiers dans le dossier pour debug
+                            try:
+                                pred_dir = os.path.join(temp_dir, 'pred_rttms')
+                                if os.path.exists(pred_dir):
+                                    files = os.listdir(pred_dir)
+                                    print(f"📁 Files in pred_rttms: {files}")
+                                else:
+                                    print(f"📁 pred_rttms directory not found")
+                            except:
+                                pass
                             speaker_labels, speakers_detected = basic_speaker_diarization(transcript_segments, request.max_speakers)
                         
                         # Cleanup
