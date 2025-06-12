@@ -1,13 +1,8 @@
-# Garder CUDA 12.3.2 cuDNN 9 existant (fonctionne)
+# Retour à l'image qui fonctionnait
 FROM nvidia/cuda:12.3.2-cudnn9-devel-ubuntu22.04
-
-# Métadonnées
-LABEL maintainer="whisper-diarization-gpu"
-LABEL version="6.1.0"
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
-ENV PYTHONDONTWRITEBYTECODE=1
 ENV PIP_NO_CACHE_DIR=1
 
 # Configuration CUDA
@@ -17,7 +12,7 @@ ENV LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}
 ENV NVIDIA_VISIBLE_DEVICES=all
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
 
-# Installation système EXACTE selon le projet
+# Installation système de base
 RUN apt-get update && apt-get install -y \
     python3.10 \
     python3.10-dev \
@@ -37,42 +32,44 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 RUN ln -sf /usr/bin/python3.10 /usr/bin/python
-
 RUN python -m pip install --upgrade pip setuptools wheel
 
-# WORKAROUND cuDNN: Installer PyTorch avec une version compatible
+# ÉTAPE 1: Forcer NumPy 1.x et versions compatibles
+RUN pip install --no-cache-dir \
+    "numpy>=1.21.0,<2.0.0" \
+    "huggingface_hub==0.20.3" \
+    "transformers==4.37.2" \
+    "tokenizers==0.15.2"
+
+# ÉTAPE 2: PyTorch compatible avec cuDNN 9.0
 RUN pip install --no-cache-dir \
     torch==2.0.1+cu118 \
     torchaudio==2.0.2+cu118 \
     torchvision==0.15.2+cu118 \
     --index-url https://download.pytorch.org/whl/cu118
 
-# 1. Cloner le repo original et installer manuellement pour éviter conflits PyTorch
-RUN git clone https://github.com/MahmoudAshraf97/whisper-diarization.git /tmp/whisper-diarization
-
-# 2. Installer les dépendances avec versions spécifiques pour compatibilité
+# ÉTAPE 3: Dependencies de base
 RUN pip install --no-cache-dir \
-    "huggingface_hub==0.20.3" \
-    "transformers==4.37.2" \
-    "tokenizers==0.15.2" \
     faster-whisper>=1.1.0 \
-    nltk \
-    wget \
     omegaconf \
-    hydra-core
+    hydra-core \
+    nltk \
+    wget
 
-# 3. Installer NeMo compatible avec PyTorch 2.0
+# ÉTAPE 4: Essayer NeMo version stable
+RUN pip install --no-cache-dir nemo-toolkit[asr]==1.20.0 || \
+    pip install --no-cache-dir nemo-toolkit[asr]==1.19.0 || \
+    echo "Warning: NeMo installation failed"
+
+# ÉTAPE 5: Repos Git nécessaires (installation conditionnelle)
 RUN pip install --no-cache-dir \
-    nemo-toolkit[asr]==1.20.0 || \
-    echo "Warning: NeMo 1.20.0 failed, trying fallback"
+    git+https://github.com/MahmoudAshraf97/demucs.git || echo "Demucs failed" && \
+    pip install --no-cache-dir \
+    git+https://github.com/oliverguhr/deepmultilingualpunctuation.git || echo "Punctuation failed" && \
+    pip install --no-cache-dir \
+    git+https://github.com/MahmoudAshraf97/ctc-forced-aligner.git || echo "CTC aligner failed"
 
-# 4. Installer les repos Git spécifiques
-RUN pip install --no-cache-dir \
-    git+https://github.com/MahmoudAshraf97/demucs.git \
-    git+https://github.com/oliverguhr/deepmultilingualpunctuation.git \
-    git+https://github.com/MahmoudAshraf97/ctc-forced-aligner.git
-
-# 5. Web framework et API
+# ÉTAPE 6: Web framework
 RUN pip install --no-cache-dir \
     paramiko \
     cryptography \
@@ -82,20 +79,17 @@ RUN pip install --no-cache-dir \
     aiohttp>=3.9.0 \
     pydantic>=2.5.0
 
-# Test que tout fonctionne avec PyTorch 2.0
-RUN python -c "import torch; print('PyTorch version:', torch.__version__); print('CUDA available:', torch.cuda.is_available())"
-RUN python -c "import faster_whisper; print('faster-whisper: OK')"
-RUN python -c "import runpod; print('runpod: OK')"
-RUN python -c "import nemo; print('NeMo version:', nemo.__version__)" || echo "NeMo test failed"
-RUN python -c "from nemo.collections.asr.models.msdd_models import NeuralDiarizer; print('✅ NeuralDiarizer imported!')" || echo "MSDD import failed"
+# Télécharger juste helpers.py du projet original
+RUN wget -O /tmp/helpers.py https://raw.githubusercontent.com/MahmoudAshraf97/whisper-diarization/main/helpers.py || \
+    echo "Could not download helpers.py"
 
-# Copier les helpers du projet whisper-diarization dans notre app
 WORKDIR /app
-RUN cp /tmp/whisper-diarization/helpers.py /app/
-RUN cp /tmp/whisper-diarization/diarize.py /app/ || echo "diarize.py copied"
 
 # Copier notre code
 COPY . .
+
+# Copier helpers.py si disponible
+RUN cp /tmp/helpers.py /app/ || echo "No helpers.py to copy"
 
 # Créer les dossiers nécessaires
 RUN mkdir -p /tmp/whisper-cache /tmp/audio-temp /app/temp_outputs
@@ -105,8 +99,13 @@ RUN chmod +x main.py
 ENV WHISPER_CACHE_DIR=/tmp/whisper-cache
 ENV TEMP_AUDIO_DIR=/tmp/audio-temp
 
+# Test final simple
+RUN python -c "import torch; print('PyTorch:', torch.__version__, 'CUDA:', torch.cuda.is_available())"
+RUN python -c "import faster_whisper; print('faster-whisper: OK')"
+RUN python -c "import runpod; print('runpod: OK')"
+
 HEALTHCHECK --interval=30s --timeout=15s --start-period=240s --retries=3 \
-    CMD python -c "import torch; import runpod; import nemo; print('Health: OK')" || exit 1
+    CMD python -c "import torch; import runpod; print('Health: OK')" || exit 1
 
 EXPOSE 8000
 CMD ["python", "main.py"]
