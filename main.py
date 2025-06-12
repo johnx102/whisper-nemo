@@ -255,6 +255,7 @@ def create_nemo_config(audio_path: str, temp_dir: str, max_speakers: int = 8):
     
     # CORRECTION PRINCIPALE : Configuration YAML correcte avec dictionnaire Python
     config_content = f"""device: cuda
+    batch_size: 16
 
 diarizer:
   out_dir: {temp_dir}
