@@ -289,9 +289,9 @@ diarizer:
   speaker_embeddings:
     model_path: titanet_large
     parameters:
-      window_length_in_sec: [1.5]
-      shift_length_in_sec: [0.75]
-      multiscale_weights: [1, 1, 1, 1, 1]
+      window_length_in_sec: [1.5, 1.0, 0.5]
+      shift_length_in_sec: [0.75, 0.5, 0.25]
+      multiscale_weights: [1, 1, 1]
       multiscale_args:
         scale_dict:
           1: [1.5]
