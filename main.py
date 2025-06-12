@@ -252,6 +252,7 @@ def basic_speaker_diarization(segments, max_speakers=2):
 
 def create_nemo_config(audio_path: str, temp_dir: str, max_speakers: int = 8) -> str:
     config_content = f"""\
+num_workers: 4    
 device: cuda
 batch_size: 16
 
