@@ -255,6 +255,7 @@ def create_nemo_config(audio_path: str, temp_dir: str, max_speakers: int = 8) ->
 num_workers: 4    
 device: cuda
 batch_size: 16
+sample_rate: 16000
 
 diarizer:
   out_dir: {temp_dir}
