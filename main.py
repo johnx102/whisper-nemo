@@ -421,6 +421,11 @@ async def process_transcription_gpu(audio_path: str, request: TranscriptionReque
                     print(f"🎯 Using NeMo MSDD with {request.min_speakers}-{request.max_speakers} speakers")
                     
                     try:
+                        # WORKAROUND: Désactiver la vérification stricte cuDNN pour NeMo
+                        import os
+                        os.environ["TORCH_CUDNN_V8_API_DISABLED"] = "1"
+                        os.environ["CUDNN_VERSION"] = "9.0.0"  # Force la version détectée
+                        
                         # Créer config directement sans utiliser create_config()
                         temp_dir = '/tmp/nemo_temp'
                         os.makedirs(temp_dir, exist_ok=True)
