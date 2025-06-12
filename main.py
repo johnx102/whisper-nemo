@@ -472,6 +472,7 @@ async def process_transcription_gpu(audio_path: str, request: TranscriptionReque
                         # Créer le diarizer
                         print("🏗️ Creating NeMo diarizer...")
                         diarizer = NeuralDiarizer(cfg=cfg)
+                        diarizer.clustering_embedding.clus_diar_model.verbose = True
                         print("✅ NeMo diarizer created, starting diarization...")
                         
                         # Lancer la diarisation
