@@ -377,7 +377,7 @@ async def process_transcription_gpu(audio_path: str, request: TranscriptionReque
                         # Configuration NeMo diarisation simplifiée
                         from omegaconf import OmegaConf
                         
-                        # Créer config NeMo directement en mémoire
+                        # Créer config NeMo complète
                         cfg = OmegaConf.create({
                             'diarizer': {
                                 'manifest_filepath': None,
@@ -388,6 +388,18 @@ async def process_transcription_gpu(audio_path: str, request: TranscriptionReque
                                         'oracle_num_speakers': False,
                                         'max_num_speakers': request.max_speakers,
                                         'enhanced_count_thres': 0.8,
+                                    }
+                                },
+                                'msdd_model': {
+                                    'model_path': 'diar_msdd_telephonic',
+                                    'parameters': {
+                                        'use_speaker_model_from_ckpt': True,
+                                        'infer_batch_size': 25,
+                                        'sigmoid_threshold': [0.7],
+                                        'seq_eval_mode': False,
+                                        'split_infer': True,
+                                        'diar_window_length': 50,
+                                        'overlap_infer_spk_limit': 5,
                                     }
                                 },
                                 'vad': {
