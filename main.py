@@ -250,35 +250,18 @@ def basic_speaker_diarization(segments, max_speakers=2):
     detected_speakers = min(num_speakers, len(set(speaker_labels)))
     return speaker_labels, detected_speakers
 
-def create_nemo_config(audio_path: str, temp_dir: str, max_speakers: int = 8):
-    """Créer une configuration NeMo correcte"""
-    
-    # CORRECTION PRINCIPALE : Configuration YAML correcte avec dictionnaire Python
-    config_content = f"""device: cuda
-    batch_size: 16
-    
+def create_nemo_config(audio_path: str, temp_dir: str, max_speakers: int = 8) -> str:
+    config_content = f"""\
+device: cuda
+batch_size: 16
 
 diarizer:
   out_dir: {temp_dir}
   oracle_vad: false
-  clustering:
-    parameters:
-      oracle_num_speakers: false
-      max_num_speakers: {max_speakers}
-      enhanced_count_thres: 0.8
-  msdd_model:
-    model_path: diar_msdd_telephonic
-    parameters:
-      use_speaker_model_from_ckpt: true
-      infer_batch_size: 25
-      sigmoid_threshold: [0.7]
-      seq_eval_mode: false
-      split_infer: true
-      diar_window_length: 50
-      overlap_infer_spk_limit: 5
+  manifest_filepath: {os.path.join(temp_dir, 'manifest.json')}
+
   vad:
     model_path: vad_multilingual_marblenet
-    external_vad_manifest: null
     parameters:
       onset: 0.8
       offset: 0.6
@@ -286,8 +269,9 @@ diarizer:
       pad_offset: -0.05
       min_duration_on: 0.2
       min_duration_off: 0.2
-      window_length_in_sec: 0.15  # ✅ AJOUT CRUCIAL
-      shift_length_in_sec: 0.01   # ✅ CONSEILLÉ AUSSI
+      window_length_in_sec: 0.15
+      shift_length_in_sec: 0.01
+
   speaker_embeddings:
     model_path: titanet_large
     parameters:
@@ -299,13 +283,29 @@ diarizer:
           1: [1.5]
           2: [1.5, 1.0]
           3: [1.5, 1.0, 0.5]
+
+  clustering:
+    parameters:
+      oracle_num_speakers: false
+      max_num_speakers: {max_speakers}
+      enhanced_count_thres: 0.8
+
+  msdd_model:
+    model_path: diar_msdd_telephonic
+    parameters:
+      use_speaker_model_from_ckpt: true
+      infer_batch_size: 25
+      sigmoid_threshold: [0.7]
+      seq_eval_mode: false
+      split_infer: true
+      diar_window_length: 50
+      overlap_infer_spk_limit: 5
 """
-    
-    config_path = os.path.join(temp_dir, 'config.yaml')
-    with open(config_path, 'w') as f:
+
+    config_path = os.path.join(temp_dir, "config.yaml")
+    with open(config_path, "w") as f:
         f.write(config_content)
-    
-    print(f"✅ NeMo config created: {config_path}")
+
     return config_path
 
 async def process_transcription_gpu(audio_path: str, request: TranscriptionRequest):
