@@ -50,6 +50,15 @@ except ImportError:
     punct_model_langs = ["fr", "en", "es", "de"]
 
 try:
+    print("🔍 Testing PyAnnote import...")
+    from pyannote.audio import Pipeline
+    PYANNOTE_AVAILABLE = True
+    print("✅ PyAnnote available for advanced diarization")
+except ImportError as e:
+    print(f"⚠️ PyAnnote not available: {e}")
+    PYANNOTE_AVAILABLE = False
+
+try:
     print("🔍 Testing NeMo import...")
     import nemo
     print(f"📦 NeMo version: {nemo.__version__}")
@@ -58,7 +67,7 @@ try:
     print("✅ NeuralDiarizer imported successfully")
     
     NEMO_AVAILABLE = True
-    print("✅ NeMo available")
+    print("✅ NeMo available (backup option)")
 except ImportError as e:
     print(f"❌ NeMo import failed: {e}")
     print(f"❌ Error type: {type(e).__name__}")
@@ -321,100 +330,179 @@ async def process_transcription_gpu(audio_path: str, request: TranscriptionReque
             try:
                 print("🎭 Starting speaker diarization...")
                 
-                if NEMO_AVAILABLE:
+                if PYANNOTE_AVAILABLE:
+                    print(f"🎯 Using PyAnnote with {request.min_speakers}-{request.max_speakers} speakers")
+                    
+                    # Charger le pipeline PyAnnote
+                    if models.get('pyannote_pipeline') is None:
+                        print("📥 Loading PyAnnote pipeline...")
+                        models['pyannote_pipeline'] = Pipeline.from_pretrained(
+                            "pyannote/speaker-diarization-3.1",
+                            use_auth_token=os.getenv("HF_TOKEN", "hf_...")  # Token HuggingFace nécessaire
+                        )
+                        print("✅ PyAnnote pipeline loaded")
+                    
+                    # Diarisation avec PyAnnote
+                    pipeline = models['pyannote_pipeline']
+                    diarization = pipeline(audio_path, num_speakers=request.max_speakers)
+                    
+                    # Mapper les résultats PyAnnote aux segments Whisper
+                    speaker_labels = []
+                    speakers_detected = len(diarization.labels())
+                    print(f"🎤 PyAnnote detected {speakers_detected} speakers: {list(diarization.labels())}")
+                    
+                    for segment in transcript_segments:
+                        segment_start = segment.start
+                        segment_end = segment.end
+                        segment_mid = (segment_start + segment_end) / 2
+                        
+                        # Trouver le speaker actif au milieu du segment
+                        assigned_speaker = "A"  # défaut
+                        for turn, _, speaker in diarization.itertracks(yield_label=True):
+                            if turn.start <= segment_mid <= turn.end:
+                                # Mapper speaker PyAnnote vers lettre
+                                speaker_labels_list = sorted(list(diarization.labels()))
+                                speaker_index = speaker_labels_list.index(speaker)
+                                assigned_speaker = chr(65 + speaker_index)  # A, B, C...
+                                break
+                        
+                        speaker_labels.append(assigned_speaker)
+                    
+                    print(f"✅ PyAnnote diarization completed: {speakers_detected} speakers")
+                    
+                elif NEMO_AVAILABLE:
                     print(f"🎯 Using NeMo MSDD with {request.min_speakers}-{request.max_speakers} speakers")
                     
-                    # Configuration NeMo diarisation
-                    from helpers import create_config
-                    
-                    # Créer config temporaire pour NeMo
-                    temp_manifest = f"/tmp/temp_manifest_{hash(audio_path)}.json"
-                    temp_config_path = f"/tmp/temp_config_{hash(audio_path)}.yaml"
-                    
-                    # Créer manifest pour NeMo
-                    manifest_entry = {
-                        "audio_filepath": audio_path,
-                        "offset": 0,
-                        "duration": len(audio_waveform) / 16000,
-                        "label": "infer",
-                        "text": "-",
-                        "num_speakers": None,
-                        "rttm_filepath": None,
-                        "uem_filepath": None
-                    }
-                    
-                    with open(temp_manifest, 'w') as f:
-                        f.write(json.dumps(manifest_entry) + '\n')
-                    
-                    # Créer config NeMo
-                    create_config(temp_config_path)
-                    
-                    # Charger et configurer le modèle NeMo
-                    if models['diarizer'] is None:
+                    try:
+                        # Configuration NeMo diarisation simplifiée
                         from omegaconf import OmegaConf
-                        cfg = OmegaConf.load(temp_config_path)
+                        
+                        # Créer config NeMo directement en mémoire
+                        cfg = OmegaConf.create({
+                            'diarizer': {
+                                'manifest_filepath': None,
+                                'out_dir': '/tmp/nemo_outputs',
+                                'oracle_vad': False,
+                                'clustering': {
+                                    'parameters': {
+                                        'oracle_num_speakers': False,
+                                        'max_num_speakers': request.max_speakers,
+                                        'enhanced_count_thres': 0.8,
+                                    }
+                                },
+                                'vad': {
+                                    'model_path': 'vad_multilingual_marblenet',
+                                    'external_vad_manifest': None,
+                                    'parameters': {
+                                        'onset': 0.8,
+                                        'offset': 0.6,
+                                        'pad_onset': 0.05,
+                                        'pad_offset': -0.05,
+                                        'min_duration_on': 0.2,
+                                        'min_duration_off': 0.2
+                                    }
+                                },
+                                'speaker_embeddings': {
+                                    'model_path': 'titanet_large',
+                                    'parameters': {
+                                        'window_length_in_sec': 1.5,
+                                        'shift_length_in_sec': 0.75,
+                                        'multiscale_weights': [1, 1, 1, 1, 1],
+                                        'multiscale_args': {"scale_dict": "{1: [1.5], 2: [1.5, 1.0], 3: [1.5, 1.0, 0.5]}"}
+                                    }
+                                }
+                            }
+                        })
+                        
+                        # Créer manifest temporaire
+                        temp_dir = '/tmp/nemo_temp'
+                        os.makedirs(temp_dir, exist_ok=True)
+                        temp_manifest = os.path.join(temp_dir, f'manifest_{hash(audio_path)}.json')
+                        
+                        manifest_entry = {
+                            "audio_filepath": audio_path,
+                            "offset": 0,
+                            "duration": len(audio_waveform) / 16000,
+                            "label": "infer",
+                            "text": "-",
+                            "num_speakers": None,
+                            "rttm_filepath": None,
+                            "uem_filepath": None
+                        }
+                        
+                        with open(temp_manifest, 'w') as f:
+                            f.write(json.dumps(manifest_entry) + '\n')
+                        
+                        # Configurer les chemins
                         cfg.diarizer.manifest_filepath = temp_manifest
-                        cfg.diarizer.out_dir = '/tmp/'
-                        cfg.diarizer.clustering.parameters.min_num_speakers = request.min_speakers
-                        cfg.diarizer.clustering.parameters.max_num_speakers = request.max_speakers
+                        cfg.diarizer.out_dir = temp_dir
                         
-                        models['diarizer'] = NeuralDiarizer(cfg=cfg)
-                        print(f"✅ NeMo diarizer loaded with {request.min_speakers}-{request.max_speakers} speakers")
-                    
-                    # Lancer la diarisation NeMo
-                    models['diarizer'].diarize()
-                    
-                    # Récupérer les résultats
-                    speaker_ts = []
-                    pred_rttm = f'/tmp/pred_rttms/{os.path.basename(audio_path).replace(".wav", ".rttm")}'
-                    if os.path.exists(pred_rttm):
-                        with open(pred_rttm, 'r') as f:
-                            for line in f:
-                                parts = line.strip().split()
-                                if len(parts) >= 8:
-                                    start_time = float(parts[3])
-                                    duration = float(parts[4])
-                                    speaker_id = parts[7]
-                                    speaker_ts.append({
-                                        'start': start_time,
-                                        'end': start_time + duration,
-                                        'speaker': speaker_id
-                                    })
-                    
-                    # Mapper les segments Whisper aux speakers NeMo
-                    if speaker_ts:
+                        # Créer le diarizer
+                        diarizer = NeuralDiarizer(cfg=cfg)
+                        print("✅ NeMo diarizer created, starting diarization...")
+                        
+                        # Lancer la diarisation
+                        diarizer.diarize()
+                        
+                        # Lire les résultats RTTM
+                        pred_rttm = os.path.join(temp_dir, 'pred_rttms', f'{os.path.splitext(os.path.basename(audio_path))[0]}.rttm')
+                        
                         speaker_labels = []
-                        speakers_detected = len(set(ts['speaker'] for ts in speaker_ts))
+                        speakers_detected = 1
                         
-                        for segment in transcript_segments:
-                            segment_start = segment.start
-                            segment_end = segment.end
-                            segment_mid = (segment_start + segment_end) / 2
+                        if os.path.exists(pred_rttm):
+                            speaker_ts = []
+                            with open(pred_rttm, 'r') as f:
+                                for line in f:
+                                    parts = line.strip().split()
+                                    if len(parts) >= 8:
+                                        start_time = float(parts[3])
+                                        duration = float(parts[4])
+                                        speaker_id = parts[7]
+                                        speaker_ts.append({
+                                            'start': start_time,
+                                            'end': start_time + duration,
+                                            'speaker': speaker_id
+                                        })
                             
-                            # Trouver le speaker pour ce segment
-                            assigned_speaker = "A"  # défaut
-                            for ts in speaker_ts:
-                                if ts['start'] <= segment_mid <= ts['end']:
-                                    # Mapper speaker_id vers lettre (0->A, 1->B, etc.)
-                                    speaker_num = int(ts['speaker'].split('_')[-1]) if '_' in ts['speaker'] else 0
-                                    assigned_speaker = chr(65 + speaker_num % 26)
-                                    break
-                            
-                            speaker_labels.append(assigned_speaker)
+                            if speaker_ts:
+                                speakers_detected = len(set(ts['speaker'] for ts in speaker_ts))
+                                print(f"🎤 Found {speakers_detected} speakers in RTTM")
+                                
+                                # Mapper aux segments Whisper
+                                for segment in transcript_segments:
+                                    segment_mid = (segment.start + segment.end) / 2
+                                    assigned_speaker = "A"
+                                    
+                                    for ts in speaker_ts:
+                                        if ts['start'] <= segment_mid <= ts['end']:
+                                            speaker_num = hash(ts['speaker']) % 26
+                                            assigned_speaker = chr(65 + speaker_num)
+                                            break
+                                    
+                                    speaker_labels.append(assigned_speaker)
+                            else:
+                                print("⚠️ No speaker data in RTTM, using basic fallback")
+                                speaker_labels, speakers_detected = basic_speaker_diarization(transcript_segments, request.max_speakers)
+                        else:
+                            print(f"⚠️ RTTM file not found: {pred_rttm}")
+                            speaker_labels, speakers_detected = basic_speaker_diarization(transcript_segments, request.max_speakers)
                         
-                        # Cleanup fichiers temporaires
+                        # Cleanup
                         try:
-                            os.unlink(temp_manifest)
-                            os.unlink(temp_config_path)
-                            if os.path.exists(pred_rttm):
-                                os.unlink(pred_rttm)
+                            import shutil
+                            shutil.rmtree(temp_dir)
                         except:
                             pass
                         
-                        print(f"✅ NeMo diarization completed: {speakers_detected} speakers detected")
-                    else:
-                        print("⚠️ NeMo diarization failed, using basic method")
+                        print(f"✅ NeMo diarization completed: {speakers_detected} speakers")
+                        
+                    except Exception as nemo_error:
+                        print(f"⚠️ NeMo diarization failed: {nemo_error}")
+                        print(traceback.format_exc())
                         speaker_labels, speakers_detected = basic_speaker_diarization(transcript_segments, request.max_speakers)
+                        print(f"✅ Fallback to basic diarization: {speakers_detected} speakers")
+                    
                 else:
                     print("🔤 Using basic diarization")
                     speaker_labels, speakers_detected = basic_speaker_diarization(transcript_segments, request.max_speakers)
@@ -458,6 +546,7 @@ async def process_transcription_gpu(audio_path: str, request: TranscriptionReque
                 "compute_type": "float16" if torch.cuda.is_available() else "int8",
                 "batch_size": request.batch_size,
                 "diarization_enabled": request.enable_diarization,
+                "pyannote_available": PYANNOTE_AVAILABLE,
                 "nemo_available": NEMO_AVAILABLE,
                 "helpers_available": HELPERS_AVAILABLE,
                 "gpu_memory_gb": torch.cuda.get_device_properties(0).total_memory / 1024**3 if torch.cuda.is_available() else 0
@@ -554,11 +643,13 @@ async def health_check():
         "device": "cuda" if torch.cuda.is_available() else "cpu",
         "pytorch_version": torch.__version__,
         "cuda_available": torch.cuda.is_available(),
+        "pyannote_available": PYANNOTE_AVAILABLE,
         "nemo_available": NEMO_AVAILABLE,
         "helpers_available": HELPERS_AVAILABLE,
         "models_loaded": {
             "whisper": models['whisper'] is not None,
             "current_model": models.get('whisper_model_name'),
+            "pyannote_pipeline": models.get('pyannote_pipeline') is not None,
             "diarizer": models['diarizer'] is not None
         },
         "gpu_info": gpu_info,
