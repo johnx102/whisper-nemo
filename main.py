@@ -284,6 +284,8 @@ diarizer:
       pad_offset: -0.05
       min_duration_on: 0.2
       min_duration_off: 0.2
+      window_length_in_sec: 0.15  # ✅ AJOUT CRUCIAL
+      shift_length_in_sec: 0.01   # ✅ CONSEILLÉ AUSSI
   speaker_embeddings:
     model_path: titanet_large
     parameters:
