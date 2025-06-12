@@ -421,18 +421,67 @@ async def process_transcription_gpu(audio_path: str, request: TranscriptionReque
                     print(f"🎯 Using NeMo MSDD with {request.min_speakers}-{request.max_speakers} speakers")
                     
                     try:
-                        # Utiliser la vraie fonction create_config du projet original
+                        # Créer config directement sans utiliser create_config()
                         temp_dir = '/tmp/nemo_temp'
                         os.makedirs(temp_dir, exist_ok=True)
                         temp_config_path = os.path.join(temp_dir, f'config_{hash(audio_path)}.yaml')
                         
-                        # Créer le config avec la vraie fonction
-                        create_config(temp_config_path)
-                        print(f"✅ Config created at {temp_config_path}")
+                        # Écrire directement le fichier YAML de config
+                        config_yaml = f"""
+device: cuda
+
+diarizer:
+  out_dir: {temp_dir}
+  oracle_vad: false
+  clustering:
+    parameters:
+      oracle_num_speakers: false
+      max_num_speakers: {request.max_speakers}
+      enhanced_count_thres: 0.8
+  msdd_model:
+    model_path: diar_msdd_telephonic
+    parameters:
+      use_speaker_model_from_ckpt: true
+      infer_batch_size: 25
+      sigmoid_threshold: [0.7]
+      seq_eval_mode: false
+      split_infer: true
+      diar_window_length: 50
+      overlap_infer_spk_limit: 5
+  vad:
+    model_path: vad_multilingual_marblenet
+    external_vad_manifest: null
+    parameters:
+      onset: 0.8
+      offset: 0.6
+      pad_onset: 0.05
+      pad_offset: -0.05
+      min_duration_on: 0.2
+      min_duration_off: 0.2
+  speaker_embeddings:
+    model_path: titanet_large
+    parameters:
+      window_length_in_sec: 1.5
+      shift_length_in_sec: 0.75
+      multiscale_weights: [1, 1, 1, 1, 1]
+      multiscale_args:
+        scale_dict: "{{1: [1.5], 2: [1.5, 1.0], 3: [1.5, 1.0, 0.5]}}"
+"""
                         
-                        # Charger et modifier la config
+                        with open(temp_config_path, 'w') as f:
+                            f.write(config_yaml)
+                        print(f"✅ Config file written to {temp_config_path}")
+                        
+                        # Vérifier que c'est bien un fichier
+                        if os.path.isfile(temp_config_path):
+                            print(f"✅ Confirmed: {temp_config_path} is a file")
+                        else:
+                            raise Exception(f"ERROR: {temp_config_path} is not a file!")
+                        
+                        # Charger la config
                         from omegaconf import OmegaConf
                         cfg = OmegaConf.load(temp_config_path)
+                        print("✅ Config loaded successfully")
                         
                         # Créer manifest temporaire
                         temp_manifest = os.path.join(temp_dir, f'manifest_{hash(audio_path)}.json')
@@ -450,15 +499,11 @@ async def process_transcription_gpu(audio_path: str, request: TranscriptionReque
                         with open(temp_manifest, 'w') as f:
                             f.write(json.dumps(manifest_entry) + '\n')
                         
-                        # Configurer les chemins et paramètres
+                        # Configurer les chemins dans la config
                         cfg.diarizer.manifest_filepath = temp_manifest
-                        cfg.diarizer.out_dir = temp_dir
-                        
-                        # Forcer les paramètres de speakers
-                        if hasattr(cfg.diarizer, 'clustering') and hasattr(cfg.diarizer.clustering, 'parameters'):
-                            cfg.diarizer.clustering.parameters.max_num_speakers = request.max_speakers
-                            cfg.diarizer.clustering.parameters.enhanced_count_thres = 0.8
-                            print(f"🎯 Set max_speakers to {request.max_speakers}")
+                        print(f"✅ Manifest: {temp_manifest}")
+                        print(f"✅ Output dir: {cfg.diarizer.out_dir}")
+                        print(f"🎯 Max speakers: {cfg.diarizer.clustering.parameters.max_num_speakers}")
                         
                         # Créer le diarizer
                         diarizer = NeuralDiarizer(cfg=cfg)
@@ -466,9 +511,31 @@ async def process_transcription_gpu(audio_path: str, request: TranscriptionReque
                         
                         # Lancer la diarisation
                         diarizer.diarize()
+                        print("✅ Diarization process completed")
                         
                         # Lire les résultats RTTM
-                        pred_rttm = os.path.join(temp_dir, 'pred_rttms', f'{os.path.splitext(os.path.basename(audio_path))[0]}.rttm')
+                        pred_rttm_dir = os.path.join(temp_dir, 'pred_rttms')
+                        audio_basename = os.path.splitext(os.path.basename(audio_path))[0]
+                        pred_rttm = os.path.join(pred_rttm_dir, f'{audio_basename}.rttm')
+                        
+                        print(f"🔍 Looking for RTTM: {pred_rttm}")
+                        
+                        # Debug: lister tous les fichiers générés
+                        try:
+                            if os.path.exists(pred_rttm_dir):
+                                files = os.listdir(pred_rttm_dir)
+                                print(f"📁 Files in pred_rttms: {files}")
+                            else:
+                                print(f"📁 pred_rttms directory not found")
+                                # Lister le contenu du temp_dir
+                                if os.path.exists(temp_dir):
+                                    all_files = []
+                                    for root, dirs, files in os.walk(temp_dir):
+                                        for file in files:
+                                            all_files.append(os.path.join(root, file))
+                                    print(f"📁 All files in temp_dir: {all_files}")
+                        except Exception as e:
+                            print(f"⚠️ Error listing files: {e}")
                         
                         speaker_labels = []
                         speakers_detected = 1
@@ -506,31 +573,22 @@ async def process_transcription_gpu(audio_path: str, request: TranscriptionReque
                                             break
                                     
                                     speaker_labels.append(assigned_speaker)
+                                
+                                print(f"✅ NeMo diarization completed: {speakers_detected} speakers")
                             else:
                                 print("⚠️ No speaker data in RTTM, using basic fallback")
                                 speaker_labels, speakers_detected = basic_speaker_diarization(transcript_segments, request.max_speakers)
                         else:
-                            print(f"⚠️ RTTM file not found: {pred_rttm}")
-                            # Lister les fichiers dans le dossier pour debug
-                            try:
-                                pred_dir = os.path.join(temp_dir, 'pred_rttms')
-                                if os.path.exists(pred_dir):
-                                    files = os.listdir(pred_dir)
-                                    print(f"📁 Files in pred_rttms: {files}")
-                                else:
-                                    print(f"📁 pred_rttms directory not found")
-                            except:
-                                pass
+                            print(f"⚠️ RTTM file not found, using basic fallback")
                             speaker_labels, speakers_detected = basic_speaker_diarization(transcript_segments, request.max_speakers)
                         
                         # Cleanup
                         try:
                             import shutil
                             shutil.rmtree(temp_dir)
-                        except:
-                            pass
-                        
-                        print(f"✅ NeMo diarization completed: {speakers_detected} speakers")
+                            print("🗑️ Cleaned up temp directory")
+                        except Exception as e:
+                            print(f"⚠️ Cleanup failed: {e}")
                         
                     except Exception as nemo_error:
                         print(f"⚠️ NeMo diarization failed: {nemo_error}")
