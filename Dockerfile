@@ -1,5 +1,5 @@
 # CUDA 12.2 comme demandé
-FROM nvidia/cuda:12.4.0-runtime-ubuntu22.04
+FROM nvidia/cuda:12.3.2-cudnn9-runtime-ubuntu22.04
 
 # Métadonnées
 LABEL maintainer="whisper-diarization-gpu"
