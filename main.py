@@ -474,32 +474,33 @@ async def process_transcription_gpu(audio_path: str, request: TranscriptionReque
                         diarizer = NeuralDiarizer(cfg=cfg)
                         print("✅ NeMo diarizer created, starting diarization...")
 
-import types
-from nemo.collections.asr.models.clustering_diarizer import ClusteringDiarizer
+                        # 👉 Patch temporaire pour corriger le bug 'self.verbose' dans _run_vad()
+                        import types
+                        from nemo.collections.asr.models.clustering_diarizer import ClusteringDiarizer
 
-def _patched_run_vad(self, manifest_vad_input):
-    from tqdm import tqdm
-    from nemo.collections.asr.parts.utils.speaker_utils import run_vad
+                        def _patched_run_vad(self, manifest_vad_input):
+                            from tqdm import tqdm
+                            from nemo.collections.asr.parts.utils.speaker_utils import run_vad
 
-    dataloader = self._vad_model.test_dataloader()
-    for batch in tqdm(dataloader, desc="vad", leave=True, disable=True):  # disable tqdm/verbose
-        run_vad(
-            batch=batch,
-            model=self._vad_model,
-            vad_inputs=[],
-            output_path=self.vad_out_dir,
-            sample_rate=self._cfg.sample_rate,
-        )
+                            dataloader = self._vad_model.test_dataloader()
+                            for batch in tqdm(dataloader, desc="vad", leave=True, disable=True):
+                                run_vad(
+                                    batch=batch,
+                                    model=self._vad_model,
+                                    vad_inputs=[],
+                                    output_path=self.vad_out_dir,
+                                    sample_rate=self._cfg.sample_rate,
+                                )
 
-# Appliquer le patch sur l'objet interne
-diarizer.clustering_embedding.clus_diar_model._run_vad = types.MethodType(
-    _patched_run_vad, diarizer.clustering_embedding.clus_diar_model
-)
-                        
+                        # Appliquer le patch sur l’objet clus_diar_model
+                        diarizer.clustering_embedding.clus_diar_model._run_vad = types.MethodType(
+                            _patched_run_vad, diarizer.clustering_embedding.clus_diar_model
+                        )
+
                         # Lancer la diarisation
-                        diarizer.verbose = True
                         diarizer.diarize()
                         print("✅ Diarization process completed")
+
                         
                         # Lire les résultats RTTM
                         pred_rttm_dir = os.path.join(temp_dir, 'pred_rttms')
