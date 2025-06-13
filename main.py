@@ -497,7 +497,7 @@ async def process_transcription_gpu(audio_path: str, request: TranscriptionReque
 
                                 print(f"🧪 Input shape before VAD: {inputs.shape}")
 
-                                logits = self._vad_model.forward(processed_signal=inputs)
+                                logits = self._vad_model.forward(input_signal=inputs)
                                 preds = logits.sigmoid().cpu().numpy()
 
                                 for idx, (pred, path) in enumerate(zip(preds, audio_paths)):
