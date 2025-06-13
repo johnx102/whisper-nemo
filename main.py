@@ -488,7 +488,7 @@ async def process_transcription_gpu(audio_path: str, request: TranscriptionReque
 
                             for batch in tqdm(dataloader, desc="vad", leave=True, disable=True):
                                 inputs, audio_paths = batch[:2]
-                                logits = self._vad_model.forward(inputs)
+                                logits = self._vad_model.forward(input_signal=inputs)
                                 preds = logits.sigmoid().cpu().numpy()
 
                                 for idx, (pred, path) in enumerate(zip(preds, audio_paths)):
