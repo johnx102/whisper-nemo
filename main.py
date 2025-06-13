@@ -124,8 +124,12 @@ class TranscriptionResponse(BaseModel):
 
 def run_nemo_diarization(audio_path: str, temp_dir: str, device: str = "cuda"):
     import os, torchaudio, torch
+    from nemo.collections.asr.models.msdd_models import NeuralDiarizer
+    from helpers import create_config
+
     os.makedirs(temp_dir, exist_ok=True)
     waveform, sr = torchaudio.load(audio_path)
+
     if sr != 16000 or waveform.shape[0] != 1:
         waveform = torchaudio.transforms.Resample(sr, 16000)(waveform)
         waveform = torch.mean(waveform, dim=0, keepdim=True)
@@ -134,9 +138,14 @@ def run_nemo_diarization(audio_path: str, temp_dir: str, device: str = "cuda"):
         torchaudio.save(os.path.join(temp_dir, "mono_file.wav"), waveform, 16000)
 
     diarizer = NeuralDiarizer(cfg=create_config(temp_dir)).to(device)
+
+    # Fix for missing attribute 'verbose' in ClusteringDiarizer during VAD step
+    if hasattr(diarizer.clustering_embedding.clus_diar_model, '__setattr__'):
+        setattr(diarizer.clustering_embedding.clus_diar_model, 'verbose', True)
+
     diarizer.diarize()
     return os.path.join(temp_dir, "pred_rttms", "mono_file.rttm")
-
+    
 def find_numeral_symbol_tokens_fallback(tokenizer):
     """Fallback si helpers pas disponibles"""
     try:
