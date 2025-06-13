@@ -489,14 +489,13 @@ async def process_transcription_gpu(audio_path: str, request: TranscriptionReque
                             for batch in tqdm(dataloader, desc="vad", leave=True, disable=True):
                                 inputs, audio_paths = batch[:2]
 
-                                # ✅ Corriger la forme de l'entrée
-                                if inputs.ndim == 2:
-                                    inputs = inputs.unsqueeze(1)  # (batch, time) -> (batch, 1, time)
-                                elif inputs.ndim == 3 and inputs.shape[1] != 1:
-                                    inputs = inputs.permute(0, 2, 1)  # (batch, time, dim) -> (batch, dim, time)
+                                # ✅ Corriger la forme en (batch, time)
+                                if inputs.ndim == 3 and inputs.shape[1] == 1:
+                                    inputs = inputs.squeeze(1)
 
                                 print(f"🧪 Input shape before VAD: {inputs.shape}")
 
+                                # ✅ input_signal doit être en (batch, time)
                                 logits = self._vad_model.forward(input_signal=inputs)
                                 preds = logits.sigmoid().cpu().numpy()
 
