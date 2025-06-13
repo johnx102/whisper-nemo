@@ -498,12 +498,17 @@ async def process_transcription_gpu(audio_path: str, request: TranscriptionReque
 
                                 print(f"🧪 Input shape before VAD: {inputs.shape}")
 
-                                # ✅ Passer processed_signal
-                             if self._vad_model.input_types and "input_signal" in self._vad_model.input_types():
-                                logits = self._vad_model(input_signal=inputs)
-                             else:
-                                logits = self._vad_model(processed_signal=inputs)
-                                preds = logits.sigmoid().cpu().numpy()
+                               
+                                print("🔍 Type de input :", type(inputs))
+                                print("🔍 Shape de input :", inputs.shape if hasattr(inputs, "shape") else "N/A")
+
+                                # Appelle le modèle VAD avec le bon type d’entrée
+                                if self._vad_model.input_types and "input_signal" in self._vad_model.input_types():
+                                    # Le modèle attend un signal brut
+                                    logits = self._vad_model(input_signal=inputs)
+                                else:
+                                # Le modèle attend un signal déjà prétraité
+                                    logits = self._vad_model(processed_signal=inputs)
 
                                 for idx, (pred, path) in enumerate(zip(preds, audio_paths)):
                                     out_path = os.path.join(self.vad_out_dir, os.path.basename(path).replace('.wav', '.rttm'))
