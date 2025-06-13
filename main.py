@@ -9,6 +9,8 @@ from typing import Optional, Dict, Any
 from datetime import datetime
 from urllib.parse import urlparse
 
+
+
 # Supprimer warnings
 warnings.filterwarnings("ignore")
 
@@ -118,6 +120,22 @@ class TranscriptionResponse(BaseModel):
     language: str
     model_info: Dict[str, Any]
     error: Optional[str] = None
+
+
+def run_nemo_diarization(audio_path: str, temp_dir: str, device: str = "cuda"):
+    import os, torchaudio, torch
+    os.makedirs(temp_dir, exist_ok=True)
+    waveform, sr = torchaudio.load(audio_path)
+    if sr != 16000 or waveform.shape[0] != 1:
+        waveform = torchaudio.transforms.Resample(sr, 16000)(waveform)
+        waveform = torch.mean(waveform, dim=0, keepdim=True)
+        torchaudio.save(os.path.join(temp_dir, "mono_file.wav"), waveform, 16000)
+    else:
+        torchaudio.save(os.path.join(temp_dir, "mono_file.wav"), waveform, 16000)
+
+    diarizer = NeuralDiarizer(cfg=create_config(temp_dir)).to(device)
+    diarizer.diarize()
+    return os.path.join(temp_dir, "pred_rttms", "mono_file.rttm")
 
 def find_numeral_symbol_tokens_fallback(tokenizer):
     """Fallback si helpers pas disponibles"""
@@ -478,69 +496,10 @@ async def process_transcription_gpu(audio_path: str, request: TranscriptionReque
                         import types
                         from nemo.collections.asr.models.clustering_diarizer import ClusteringDiarizer
 
-                        def _patched_run_vad(self, manifest_vad_input):
-                            from tqdm import tqdm
-                            import os
-                            import soundfile as sf
-
-                            vad_outputs = []
-                            dataloader = self._vad_model.test_dataloader()
-
-                            for batch in tqdm(dataloader, desc="vad", leave=True, disable=True):
-                                inputs, audio_paths = batch[:2]
-
-                                # ✅ Corriger la forme pour processed_signal : (batch, features, time)
-                                if inputs.ndim == 2:
-                                    inputs = inputs.unsqueeze(0)  # (features, time) → (1, features, time)
-                                elif inputs.ndim == 3 and inputs.shape[1] not in [80, 64]:
-                                    # Exemple : si (batch, time, features) => permute
-                                    inputs = inputs.permute(0, 2, 1)
-
-                                print(f"🧪 Input shape before VAD: {inputs.shape}")
-
-                               
-                                print("🔍 Type de input :", type(inputs))
-                                print("🔍 Shape de input :", inputs.shape if hasattr(inputs, "shape") else "N/A")
-
-                                # Appelle le modèle VAD avec le bon type d’entrée
-                                if self._vad_model.input_types and "input_signal" in self._vad_model.input_types():
-                                    # Le modèle attend un signal brut
-                                    logits = self._vad_model(input_signal=inputs)
-                                else:
-                                # Le modèle attend un signal déjà prétraité
-                                    logits = self._vad_model(processed_signal=inputs)
-
-                                for idx, (pred, path) in enumerate(zip(preds, audio_paths)):
-                                    out_path = os.path.join(self.vad_out_dir, os.path.basename(path).replace('.wav', '.rttm'))
-                                    speech_segments = []
-                                    threshold = 0.5
-                                    sr = self._cfg.sample_rate
-                                    frame_shift = 0.01
-
-                                    start = None
-                                    for i, p in enumerate(pred):
-                                        if p >= threshold and start is None:
-                                            start = i * frame_shift
-                                        elif p < threshold and start is not None:
-                                            end = i * frame_shift
-                                            speech_segments.append((start, end - start))
-                                            start = None
-                                    if start is not None:
-                                        end = len(pred) * frame_shift
-                                        speech_segments.append((start, end - start))
-
-                                    with open(out_path, 'w') as fout:
-                                        for seg in speech_segments:
-                                            fout.write(
-                                                f"SPEAKER {path} 1 {seg[0]:.3f} {seg[1]:.3f} <NA> <NA> speaker0 <NA> <NA>\n"
-                                            )
-
-                        diarizer.clustering_embedding.clus_diar_model._run_vad = types.MethodType(
-                            _patched_run_vad, diarizer.clustering_embedding.clus_diar_model
-                        )
 
                         # Lancer la diarisation
                         diarizer.diarize()
+                        rttm_path = run_nemo_diarization(audio_path, f"/tmp/nemo_{hash(audio_path)}", device)
                         print("✅ Diarization process completed")
 
 
