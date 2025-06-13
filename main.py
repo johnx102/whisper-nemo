@@ -478,7 +478,7 @@ async def process_transcription_gpu(audio_path: str, request: TranscriptionReque
                         import types
                         from nemo.collections.asr.models.clustering_diarizer import ClusteringDiarizer
 
-                        def _patched_run_vad(self, manifest_vad_input):
+                                                def _patched_run_vad(self, manifest_vad_input):
                             from tqdm import tqdm
                             import os
                             import soundfile as sf
@@ -489,13 +489,16 @@ async def process_transcription_gpu(audio_path: str, request: TranscriptionReque
                             for batch in tqdm(dataloader, desc="vad", leave=True, disable=True):
                                 inputs, audio_paths = batch[:2]
 
-                                # ✅ Corriger la forme en (batch, time)
-                                if inputs.ndim == 3 and inputs.shape[1] == 1:
-                                    inputs = inputs.squeeze(1)
+                                # ✅ Corriger la forme pour processed_signal : (batch, features, time)
+                                if inputs.ndim == 2:
+                                    inputs = inputs.unsqueeze(0)  # (features, time) → (1, features, time)
+                                elif inputs.ndim == 3 and inputs.shape[1] not in [80, 64]:
+                                    # Exemple : si (batch, time, features) => permute
+                                    inputs = inputs.permute(0, 2, 1)
 
                                 print(f"🧪 Input shape before VAD: {inputs.shape}")
 
-                                # ✅ input_signal doit être en (batch, time)
+                                # ✅ Passer processed_signal
                                 logits = self._vad_model.forward(processed_signal=inputs)
                                 preds = logits.sigmoid().cpu().numpy()
 
