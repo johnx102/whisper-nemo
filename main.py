@@ -488,6 +488,15 @@ async def process_transcription_gpu(audio_path: str, request: TranscriptionReque
 
                             for batch in tqdm(dataloader, desc="vad", leave=True, disable=True):
                                 inputs, audio_paths = batch[:2]
+
+                                # ✅ Corriger la forme de l'entrée
+                                if inputs.ndim == 2:
+                                    inputs = inputs.unsqueeze(1)  # (batch, time) -> (batch, 1, time)
+                                elif inputs.ndim == 3 and inputs.shape[1] != 1:
+                                    inputs = inputs.permute(0, 2, 1)  # (batch, time, dim) -> (batch, dim, time)
+
+                                print(f"🧪 Input shape before VAD: {inputs.shape}")
+
                                 logits = self._vad_model.forward(processed_signal=inputs)
                                 preds = logits.sigmoid().cpu().numpy()
 
@@ -513,7 +522,7 @@ async def process_transcription_gpu(audio_path: str, request: TranscriptionReque
                                     with open(out_path, 'w') as fout:
                                         for seg in speech_segments:
                                             fout.write(
-                                                f"SPEAKER {path} 1 {seg[0]:.3f} {seg[1]:.3f} <NA> <NA> speaker0 <NA> <NA>\\n"
+                                                f"SPEAKER {path} 1 {seg[0]:.3f} {seg[1]:.3f} <NA> <NA> speaker0 <NA> <NA>\n"
                                             )
 
                         diarizer.clustering_embedding.clus_diar_model._run_vad = types.MethodType(
