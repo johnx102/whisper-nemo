@@ -478,7 +478,7 @@ async def process_transcription_gpu(audio_path: str, request: TranscriptionReque
                         import types
                         from nemo.collections.asr.models.clustering_diarizer import ClusteringDiarizer
 
-                                                def _patched_run_vad(self, manifest_vad_input):
+                        def _patched_run_vad(self, manifest_vad_input):
                             from tqdm import tqdm
                             import os
                             import soundfile as sf
