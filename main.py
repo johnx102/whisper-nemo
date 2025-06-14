@@ -139,9 +139,9 @@ def run_nemo_diarization(audio_path: str, temp_dir: str, device: str = "cuda"):
 
     diarizer = NeuralDiarizer(cfg=create_config(temp_dir)).to(device)
 
-    # Fix for missing attribute 'verbose' in ClusteringDiarizer during VAD step
-    if hasattr(diarizer.clustering_embedding.clus_diar_model, '__setattr__'):
-        setattr(diarizer.clustering_embedding.clus_diar_model, 'verbose', True)
+    # Patch to fix missing `verbose` attribute
+    if hasattr(diarizer.clustering_embedding.clus_diar_model, "__dict__"):
+        diarizer.clustering_embedding.clus_diar_model.__dict__["verbose"] = True
 
     diarizer.diarize()
     return os.path.join(temp_dir, "pred_rttms", "mono_file.rttm")
