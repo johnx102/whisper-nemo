@@ -57,8 +57,7 @@ RUN pip install --no-cache-dir \
     wget
 
 # ÉTAPE 4: Essayer NeMo version stable
-RUN pip install --no-cache-dir nemo-toolkit[asr]==1.20.0 || \
-    pip install --no-cache-dir nemo-toolkit[asr]==1.19.0 || \
+RUN pip install --no-cache-dir nemo-toolkit[asr]==2.0.0
     echo "Warning: NeMo installation failed"
 
 # ÉTAPE 5: Repos Git nécessaires (installation conditionnelle)
