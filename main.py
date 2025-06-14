@@ -1,4 +1,72 @@
-"""
+def handler(event):
+    """Handler principal RunPod avec processus séparés - LOGIQUE ORIGINALE"""
+    try:
+        # Chargement des modèles - comme votre code original
+        load_models()
+        
+        # Extraction des paramètres
+        job_input = event.get("input", {})
+        audio_url = job_input.get("audio_url")
+        
+        if not audio_url:
+            return {"error": "Paramètre 'audio_url' manquant dans input"}
+        
+        # Paramètres par défaut optimisés comme votre code
+        num_speakers = job_input.get("num_speakers")
+        min_speakers = job_input.get("min_speakers", 2)
+        max_speakers = job_input.get("max_speakers", 3)
+        
+        logger.info(f"🚀 Début traitement avec processus séparés: {audio_url}")
+        logger.info(f"👥 Paramètres: num={num_speakers}, min={min_speakers}, max={max_speakers}")
+        
+        # Téléchargement
+        audio_path, download_error = download_audio(audio_url)
+        if download_error:
+            return {"error": f"Erreur téléchargement: {download_error}"}
+        
+        try:
+            # Transcription + Diarisation avec processus séparés (SEULE NOUVEAUTÉ)
+            result = transcribe_and_diarize_separated(
+                audio_path,
+                num_speakers=num_speakers,
+                min_speakers=min_speakers,
+                max_speakers=max_speakers
+            )
+            
+            if not result['success']:
+                return {"error": f"Erreur traitement: {result.get('error', 'Erreur inconnue')}"}
+            
+            # Création du transcript formaté
+            formatted_transcript = create_formatted_transcript(result['segments'])
+            
+            # Retour identique à votre code original
+            return {
+                "transcription": result['transcription'],
+                "transcription_formatee": formatted_transcript,
+                "segments": result['segments'],
+                "speakers_detected": result['speakers_detected'],
+                "language": result['language'],
+                "diarization_available": result['diarization_available'],
+                "device": str(device),
+                "model": "whisper-large-v2",
+                "pyannote_model": "speaker-diarization-3.1",
+                "processing_method": "separated_processes",  # Seule différence
+                "success": True,
+                # Infos de debug
+                "speakers_found_by_diarization": result.get('speakers_found_by_diarization', []),
+                "diarization_params_used": result.get('diarization_params_used', {}),
+                "warning": result.get('warning')
+            }
+            
+        finally:
+            # Nettoyage
+            if os.path.exists(audio_path):
+                os.unlink(audio_path)
+                logger.info("🗑️ Fichier temporaire supprimé")
+        
+    except Exception as e:
+        logger.error(f"❌ Erreur handler: {e}")
+        return {"error": f"Erreur interne: {str(e)}"}"""
 Handler RunPod Serverless pour Transcription + Diarization SÉPARÉE
 Amélioration: processus séparés pour de meilleurs résultats
 """
@@ -42,17 +110,13 @@ whisper_model = None
 diarization_pipeline = None
 
 def load_models():
-    """Chargement des modèles avec configuration optimisée"""
+    """Chargement des modèles - RETOUR À LA LOGIQUE ORIGINALE"""
     global whisper_model, diarization_pipeline
     
     if whisper_model is None:
         logger.info("🔄 Chargement Whisper large-v2...")
-        try:
-            whisper_model = whisper.load_model("large-v2", device=device)
-            logger.info("✅ Whisper chargé avec succès")
-        except Exception as e:
-            logger.error(f"❌ Erreur chargement Whisper: {e}")
-            raise e
+        whisper_model = whisper.load_model("large-v2", device=device)
+        logger.info("✅ Whisper chargé")
     
     if diarization_pipeline is None:
         logger.info("🔄 Chargement pyannote diarization...")
@@ -64,49 +128,33 @@ def load_models():
                 logger.error("❌ HUGGINGFACE_TOKEN manquant - diarization impossible")
                 return
             
-            # Essayer plusieurs modèles en fallback
-            models_to_try = [
-                "pyannote/speaker-diarization-3.1",
-                "pyannote/speaker-diarization@2022.07",
-                "pyannote/speaker-diarization"
-            ]
+            # RETOUR À VOTRE CODE ORIGINAL - simple et efficace
+            model_name = "pyannote/speaker-diarization-3.1"
+            logger.info(f"📥 Chargement du modèle: {model_name}")
             
-            for model_name in models_to_try:
+            diarization_pipeline = Pipeline.from_pretrained(
+                model_name,
+                use_auth_token=hf_token
+            )
+            
+            # GPU comme dans votre version
+            if torch.cuda.is_available():
+                logger.info("🚀 Déplacement du pipeline vers GPU...")
+                diarization_pipeline.to(device)
+                
                 try:
-                    logger.info(f"📥 Tentative chargement: {model_name}")
-                    
-                    diarization_pipeline = Pipeline.from_pretrained(
-                        model_name,
-                        use_auth_token=hf_token,
-                        cache_dir="/tmp/huggingface_cache"  # Cache explicite
-                    )
-                    
-                    if torch.cuda.is_available():
-                        logger.info("🚀 Déplacement du pipeline vers GPU...")
-                        diarization_pipeline.to(device)
-                        
-                        try:
-                            pipeline_device = next(diarization_pipeline.parameters()).device
-                            logger.info(f"✅ Pipeline sur device: {pipeline_device}")
-                        except:
-                            logger.warning("⚠️ Impossible de vérifier le device du pipeline")
-                    
-                    logger.info(f"✅ pyannote chargé avec succès: {model_name}")
-                    break
-                    
-                except Exception as model_error:
-                    logger.warning(f"⚠️ Échec chargement {model_name}: {model_error}")
-                    if model_name == models_to_try[-1]:  # Dernier modèle
-                        raise model_error
-                    continue
+                    pipeline_device = next(diarization_pipeline.parameters()).device
+                    logger.info(f"✅ Pipeline sur device: {pipeline_device}")
+                except:
+                    logger.warning("⚠️ Impossible de vérifier le device du pipeline")
+            
+            logger.info("✅ pyannote chargé et configuré")
             
         except Exception as e:
             logger.error(f"❌ Erreur chargement pyannote: {e}")
-            logger.info("💡 Solutions possibles:")
-            logger.info("   - Vérifier HUGGINGFACE_TOKEN")
-            logger.info("   - Accepter les conditions: https://huggingface.co/pyannote/speaker-diarization-3.1")
-            logger.info("   - Vérifier la connexion internet")
-            logger.info("   - Redémarrer le container pour vider le cache")
+            logger.info("💡 Vérifiez :")
+            logger.info("   - HUGGINGFACE_TOKEN est défini")
+            logger.info("   - Vous avez accepté les conditions: https://huggingface.co/pyannote/speaker-diarization-3.1")
             diarization_pipeline = None
 
 def format_timestamp(seconds):
