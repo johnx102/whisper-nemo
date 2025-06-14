@@ -497,13 +497,29 @@ def transcribe_and_diarize_separated(audio_path, num_speakers=None, min_speakers
         }
 
 def create_formatted_transcript(segments):
-    """Crée un transcript formaté avec speakers et statistiques"""
+    """Crée un transcript formaté avec speakers et statistiques - Version améliorée"""
     if not segments:
         return "Aucune transcription disponible."
     
+    # Filtrer encore une fois les segments pour l'affichage
+    display_segments = []
+    for segment in segments:
+        text = segment.get("text", "").strip()
+        duration = segment.get("end", 0) - segment.get("start", 0)
+        
+        # Ne garder que les segments avec du contenu réel
+        if (text and 
+            text not in [".", ",", "!", "?", "...", "-", " ", "..."] and
+            len(text) > 1 and
+            duration >= 0.5):  # Au moins 0.5s
+            display_segments.append(segment)
+    
+    if not display_segments:
+        return "Aucun contenu parlé détecté dans cet audio."
+    
     # Statistiques par speaker
     speaker_stats = {}
-    for segment in segments:
+    for segment in display_segments:
         speaker = segment["speaker"]
         if speaker not in speaker_stats:
             speaker_stats[speaker] = {
@@ -522,7 +538,7 @@ def create_formatted_transcript(segments):
         speaker_stats[speaker]["avg_coverage"] += segment.get("speaker_coverage", 0)
     
     # Calculer moyennes
-    total_duration = segments[-1]["end"] if segments else 0
+    total_duration = display_segments[-1]["end"] if display_segments else 0
     for speaker in speaker_stats:
         stats = speaker_stats[speaker]
         stats["avg_confidence"] /= stats["segments_count"]
@@ -530,39 +546,86 @@ def create_formatted_transcript(segments):
         stats["percentage"] = (stats["total_time"] / total_duration * 100) if total_duration > 0 else 0
     
     # Créer le transcript
-    lines = ["=== TRANSCRIPTION AVEC DIARISATION SÉPARÉE ===\n"]
+    lines = ["=== TRANSCRIPTION AVEC DIARISATION AMÉLIORÉE ===\n"]
     
     # Statistiques détaillées
     lines.append("📊 ANALYSE DES PARTICIPANTS:")
     for speaker, stats in speaker_stats.items():
+        if speaker == "SPEAKER_UNKNOWN":
+            continue  # Ignorer les segments non attribués dans les stats
+            
         conf = int(stats["avg_confidence"] * 100)
         coverage = int(stats["avg_coverage"] * 100)
         time_str = f"{stats['total_time']:.1f}s"
         percentage = f"{stats['percentage']:.1f}%"
-        lines.append(f"🗣️ {speaker}: {time_str} ({percentage}) - Confiance: {conf}% - Attribution: {coverage}%")
+        
+        # Indicateur de qualité de l'attribution
+        quality_indicator = "✅" if coverage > 60 else "⚠️" if coverage > 30 else "❌"
+        
+        lines.append(f"🗣️ {speaker}: {time_str} ({percentage}) - Confiance: {conf}% - Attribution: {coverage}% {quality_indicator}")
+    
+    lines.append(f"\n📈 QUALITÉ GLOBALE:")
+    lines.append(f"   📝 Segments utiles: {len(display_segments)}")
+    lines.append(f"   ⏱️ Durée totale: {total_duration:.1f}s")
+    lines.append(f"   🎯 Speakers identifiés: {len([s for s in speaker_stats.keys() if s != 'SPEAKER_UNKNOWN'])}")
     
     lines.append("\n" + "="*60)
     lines.append("📝 CONVERSATION CHRONOLOGIQUE:")
     
-    # Format conversation
+    # Format conversation amélioré
     current_speaker = None
-    for segment in segments:
+    for segment in display_segments:
         start_time = format_timestamp(segment["start"])
         end_time = format_timestamp(segment["end"])
         confidence = int(segment["confidence"] * 100)
         coverage = int(segment.get("speaker_coverage", 0) * 100)
         
+        # Changer de speaker
         if segment["speaker"] != current_speaker:
-            lines.append(f"\n👤 {segment['speaker']} prend la parole:")
+            speaker_name = segment["speaker"]
+            if speaker_name == "SPEAKER_UNKNOWN":
+                speaker_name = "🤷 SPEAKER_INCONNU"
+            lines.append(f"\n👤 {speaker_name}:")
             current_speaker = segment["speaker"]
         
+        # Indicateurs de qualité avec couleurs
         quality_icons = ""
         if segment.get("smoothed"):
-            quality_icons += "🔧"
-        if segment.get("speaker_coverage", 1) < 0.5:
-            quality_icons += "⚠️"
+            quality_icons += "🔧"  # Segment lissé
+        if coverage < 30:
+            quality_icons += "❓"  # Attribution très incertaine
+        elif coverage < 60:
+            quality_icons += "⚠️"  # Attribution incertaine
         
-        lines.append(f"[{start_time}-{end_time}] {segment['text']} (conf:{confidence}% attr:{coverage}%) {quality_icons}")
+        # Indicateur de confiance
+        if confidence < 40:
+            quality_icons += "🔇"  # Confiance très faible
+        elif confidence < 70:
+            quality_icons += "🔉"  # Confiance moyenne
+        
+        # Affichage du segment avec indicateurs
+        confidence_color = "🟢" if confidence > 70 else "🟡" if confidence > 40 else "🔴"
+        coverage_color = "🟢" if coverage > 60 else "🟡" if coverage > 30 else "🔴"
+        
+        lines.append(f"   [{start_time}-{end_time}] {segment['text']}")
+        lines.append(f"      └─ {confidence_color}Conf:{confidence}% {coverage_color}Attr:{coverage}% {quality_icons}")
+    
+    # Résumé de fin
+    lines.append(f"\n" + "="*60)
+    lines.append(f"📊 RÉSUMÉ:")
+    
+    # Qualité globale
+    avg_confidence = sum(seg["confidence"] for seg in display_segments) / len(display_segments) * 100
+    avg_coverage = sum(seg.get("speaker_coverage", 0) for seg in display_segments) / len(display_segments) * 100
+    
+    lines.append(f"   🎯 Qualité transcription: {avg_confidence:.0f}%")
+    lines.append(f"   🎭 Qualité diarisation: {avg_coverage:.0f}%")
+    
+    # Recommandations
+    if avg_confidence < 50:
+        lines.append(f"   💡 Recommandation: Audio de qualité faible - vérifiez le contenu")
+    if avg_coverage < 40:
+        lines.append(f"   💡 Recommandation: Diarisation incertaine - possibles erreurs d'attribution")
     
     return "\n".join(lines)
 
