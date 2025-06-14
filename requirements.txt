@@ -9,3 +9,5 @@ soundfile
 requests
 numpy
 scipy
+speechbrain
+onnxruntime
