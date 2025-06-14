@@ -9,8 +9,6 @@ from nemo.collections.asr.models.msdd_models import NeuralDiarizer
 from helpers import create_config
 import types
 from tqdm import tqdm
-import tempfile
-import requests
 from faster_whisper import WhisperModel
 
 app = FastAPI()
@@ -26,15 +24,16 @@ NEMO_AVAILABLE = True
 HELPERS_AVAILABLE = True
 PYANNOTE_AVAILABLE = False
 
-
-def run_transcription(audio_path: str, device: str = "cuda"):
-    model = WhisperModel("large-v2", device=device, compute_type="float16")
-    segments, info = model.transcribe(audio_path, beam_size=5)
-    transcript = "".join([seg.text for seg in segments])
-    return transcript
-
+def transcribe_whisper(audio_path: str, model_size="medium", device="cuda"):
+    print("🔤 Loading Whisper model...")
+    model = WhisperModel(model_size, device=device, compute_type="float16" if device == "cuda" else "int8")
+    print("🎙️ Starting transcription...")
+    segments, info = model.transcribe(audio_path)
+    print("✅ Transcription complete.")
+    return "".join([seg.text for seg in segments])
 
 def run_nemo_diarization(audio_path: str, temp_dir: str, device: str = "cuda"):
+    print("🎛️ Starting diarization with NeMo...")
     os.makedirs(temp_dir, exist_ok=True)
     waveform, sr = torchaudio.load(audio_path)
 
@@ -45,6 +44,7 @@ def run_nemo_diarization(audio_path: str, temp_dir: str, device: str = "cuda"):
     else:
         torchaudio.save(os.path.join(temp_dir, "mono_file.wav"), waveform, 16000)
 
+    print("📦 Loading NeMo diarizer model...")
     diarizer = NeuralDiarizer(cfg=create_config(temp_dir)).to(device)
 
     def patched_run_vad(self, manifest_vad_input):
@@ -87,7 +87,9 @@ def run_nemo_diarization(audio_path: str, temp_dir: str, device: str = "cuda"):
         patched_run_vad, diarizer.clustering_embedding.clus_diar_model
     )
 
+    print("🧠 Running diarization...")
     diarizer.diarize()
+    print("✅ Diarization complete.")
     return os.path.join(temp_dir, "pred_rttms", "mono_file.rttm")
 
 
@@ -98,13 +100,16 @@ async def diarize_endpoint(file: UploadFile = File(...)):
         shutil.copyfileobj(file.file, buffer)
 
     temp_dir = "/tmp/diarization"
-    transcript = run_transcription(audio_path)
+    transcript = transcribe_whisper(audio_path)
     rttm_path = run_nemo_diarization(audio_path, temp_dir)
 
     with open(rttm_path, "r") as f:
         rttm_content = f.read()
 
-    return {"transcript": transcript, "rttm": rttm_content}
+    return {
+        "transcript": transcript,
+        "rttm": rttm_content
+    }
 
 
 # RunPod serverless handler
@@ -117,7 +122,11 @@ async def handler(job):
         if "url" not in job_input:
             return {"error": "Missing 'url' in input."}
 
+        # Download the audio file to /tmp
+        import requests
+        import tempfile
         audio_url = job_input["url"]
+        print(f"🌐 Downloading from: {audio_url}")
         response = requests.get(audio_url, stream=True)
 
         if response.status_code != 200:
@@ -132,7 +141,7 @@ async def handler(job):
         print(f"📥 Downloaded to {audio_path}")
 
         temp_dir = "/tmp/diarization"
-        transcript = run_transcription(audio_path)
+        transcript = transcribe_whisper(audio_path)
         rttm_path = run_nemo_diarization(audio_path, temp_dir)
 
         with open(rttm_path, "r") as f:
@@ -140,7 +149,10 @@ async def handler(job):
 
         os.unlink(audio_path)
 
-        return {"transcript": transcript, "rttm": rttm_content}
+        return {
+            "transcript": transcript,
+            "rttm": rttm_content
+        }
 
     except Exception as e:
         print(f"❌ Handler error: {str(e)}")
