@@ -53,14 +53,14 @@ def load_models():
             
             if hf_token:
                 diarization_pipeline = Pipeline.from_pretrained(
-                    "pyannote/speaker-diarization-3.1",
+                    "pyannote/speaker-diarization-3.0",
                     use_auth_token=hf_token
                 )
                 logger.info("✅ pyannote chargé avec token")
             else:
                 logger.warning("⚠️ Pas de token HF - tentative sans token")
                 diarization_pipeline = Pipeline.from_pretrained(
-                    "pyannote/speaker-diarization-3.1"
+                    "pyannote/speaker-diarization-3.0"
                 )
             
             if torch.cuda.is_available():
