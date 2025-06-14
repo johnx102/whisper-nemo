@@ -1,100 +1,3 @@
-def transcribe_with_whisper(audio_path):
-    """ÉTAPE 1: Transcription seule avec Whisper - Version robuste"""
-    try:
-        logger.info("🎯 ÉTAPE 1: Transcription Whisper...")
-        
-        # Vérification du fichier
-        if not os.path.exists(audio_path):
-            return {'success': False, 'error': f'Fichier audio introuvable: {audio_path}'}
-        
-        file_size = os.path.getsize(audio_path)
-        logger.info(f"📁 Taille fichier: {file_size} bytes ({file_size/1024/1024:.2f}MB)")
-        
-        if file_size == 0:
-            return {'success': False, 'error': 'Fichier audio vide'}
-        
-        # Transcription avec gestion d'erreur de version
-        logger.info("🎯 Lancement transcription...")
-        
-        try:
-            # Méthode principale
-            result = whisper_model.transcribe(
-                audio_path,
-                language='fr',
-                fp16=torch.cuda.is_available(),
-                condition_on_previous_text=False,
-                no_speech_threshold=0.6,
-                logprob_threshold=-1.0,
-                compression_ratio_threshold=2.4,
-                temperature=0.0,
-                verbose=False
-            )
-            
-        except Exception as whisper_error:
-            logger.warning(f"⚠️ Erreur transcription standard: {whisper_error}")
-            
-            # FALLBACK: Méthode alternative sans certains paramètres
-            logger.info("🔄 Tentative transcription simplifiée...")
-            try:
-                result = whisper_model.transcribe(
-                    audio_path,
-                    language='fr',
-                    verbose=False
-                )
-            except Exception as whisper_error2:
-                logger.error(f"❌ Échec transcription simplifiée: {whisper_error2}")
-                
-                # FALLBACK 2: Transcription sans spécification de langue
-                logger.info("🔄 Tentative transcription minimale...")
-                try:
-                    result = whisper_model.transcribe(audio_path)
-                except Exception as whisper_error3:
-                    return {
-                        'success': False,
-                        'error': f'Échec total transcription: {whisper_error3}'
-                    }
-        
-        logger.info(f"📊 Transcription réussie:")
-        logger.info(f"   📝 Texte: '{result.get('text', '')[:100]}...'")
-        logger.info(f"   🌍 Langue: {result.get('language', 'unknown')}")
-        logger.info(f"   📈 Segments: {len(result.get('segments', []))}")
-        
-        # Nettoyage des segments
-        segments_raw = result.get("segments", [])
-        cleaned_segments = []
-        
-        for segment in segments_raw:
-            text = segment.get("text", "").strip()
-            if text:  # Garder seulement les segments avec du texte
-                cleaned_segments.append({
-                    "start": segment.get("start", 0),
-                    "end": segment.get("end", 0),
-                    "text": text,
-                    "confidence": 1 - segment.get("no_speech_prob", 0),
-                    "words": segment.get("words", [])
-                })
-        
-        logger.info(f"✅ Transcription terminée: {len(cleaned_segments)} segments utiles")
-        
-        return {
-            'success': True,
-            'transcription': result.get("text", ""),
-            'segments': cleaned_segments,
-            'language': result.get("language", "fr")
-        }
-        
-    except Exception as e:
-        logger.error(f"❌ Erreur transcription globale: {e}")
-        import traceback
-        logger.error(f"🔍 Traceback: {traceback.format_exc()}")
-        return {
-            'success': False,
-            'error': str(e)
-        }"""
-Handler RunPod Serverless pour Transcription + Diarisation SÉPARÉE
-Amélioration: processus séparés pour de meilleurs résultats
-"""
-
 import runpod
 import whisper
 from pyannote.audio import Pipeline
@@ -106,6 +9,9 @@ import torch
 import requests
 import json
 from urllib.parse import urlparse
+import time
+import random
+import traceback
 
 # Configuration logging
 logging.basicConfig(level=logging.INFO)
@@ -134,7 +40,7 @@ whisper_model = None
 diarization_pipeline = None
 
 def load_models():
-    """Chargement des modèles avec gestion du rate limiting HuggingFace"""
+    """Chargement des modèles avec gestion du rate limiting"""
     global whisper_model, diarization_pipeline
     
     if whisper_model is None:
@@ -144,7 +50,6 @@ def load_models():
             logger.info("✅ Whisper chargé")
         except Exception as e:
             logger.error(f"❌ Erreur chargement Whisper: {e}")
-            # Essayer avec une version plus simple si problème
             try:
                 logger.info("🔄 Tentative Whisper base...")
                 whisper_model = whisper.load_model("base", device=device)
@@ -163,31 +68,29 @@ def load_models():
                 logger.error("❌ HUGGINGFACE_TOKEN manquant - diarization impossible")
                 return
             
-            # GESTION RATE LIMITING : Délai avant requête
-            import time
-            import random
-            delay = random.uniform(2, 5)  # Délai aléatoire pour éviter la concurrence
+            # GESTION RATE LIMITING
+            delay = random.uniform(2, 5)
             logger.info(f"⏱️ Délai anti-rate-limit: {delay:.1f}s")
             time.sleep(delay)
             
             model_name = "pyannote/speaker-diarization-3.1"
-            logger.info(f"📥 Chargement du modèle avec retry: {model_name}")
+            logger.info(f"📥 Chargement du modèle: {model_name}")
             
-            # Retry avec backoff exponentiel pour gérer le 429
+            # Retry avec backoff exponentiel
             max_retries = 3
             for attempt in range(max_retries):
                 try:
                     diarization_pipeline = Pipeline.from_pretrained(
                         model_name,
                         use_auth_token=hf_token,
-                        cache_dir="/tmp/hf_cache_persistent"  # Cache persistent
+                        cache_dir="/tmp/hf_cache_persistent"
                     )
-                    break  # Succès !
+                    break
                     
                 except Exception as e:
                     error_str = str(e)
                     if "429" in error_str or "Too Many Requests" in error_str:
-                        wait_time = (2 ** attempt) * 10  # Backoff exponentiel : 10s, 20s, 40s
+                        wait_time = (2 ** attempt) * 10
                         logger.warning(f"⚠️ Rate limit HF (tentative {attempt+1}/{max_retries}), attente {wait_time}s...")
                         if attempt < max_retries - 1:
                             time.sleep(wait_time)
@@ -196,7 +99,6 @@ def load_models():
                             logger.error("❌ Rate limit HF persistant - abandon pyannote")
                             raise e
                     else:
-                        # Autre erreur, pas de retry
                         raise e
             
             # Configuration GPU
@@ -222,7 +124,7 @@ def load_models():
             else:
                 logger.info("💡 Vérifiez :")
                 logger.info("   - HUGGINGFACE_TOKEN est défini")
-                logger.info("   - Vous avez accepté les conditions: https://huggingface.co/pyannote/speaker-diarization-3.1")
+                logger.info("   - Vous avez accepté les conditions")
             diarization_pipeline = None
 
 def format_timestamp(seconds):
@@ -230,77 +132,45 @@ def format_timestamp(seconds):
     return str(timedelta(seconds=int(seconds)))[2:]
 
 def download_audio(audio_url, max_size_mb=100):
-    """Télécharge un fichier audio depuis une URL avec diagnostics détaillés"""
+    """Télécharge un fichier audio depuis une URL"""
     try:
         logger.info(f"📥 Téléchargement: {audio_url}")
         
-        # Vérification préliminaire avec plus de détails
-        try:
-            logger.info("🔍 Vérification HEAD request...")
-            head_response = requests.head(audio_url, timeout=10, allow_redirects=True)
-            logger.info(f"📊 Status HEAD: {head_response.status_code}")
-            logger.info(f"📋 Headers HEAD: {dict(head_response.headers)}")
-            
-            if head_response.status_code != 200:
-                logger.warning(f"⚠️ HEAD request non-200, tentative GET quand même...")
-        except Exception as head_error:
-            logger.warning(f"⚠️ HEAD request échoué: {head_error}, continuons avec GET")
-            head_response = None
+        # Vérification préliminaire
+        head_response = requests.head(audio_url, timeout=10)
+        if head_response.status_code != 200:
+            return None, f"URL non accessible: HTTP {head_response.status_code}"
         
-        if head_response:
-            content_length = head_response.headers.get('content-length')
-            if content_length:
-                size_mb = int(content_length) / (1024 * 1024)
-                logger.info(f"📏 Taille annoncée: {size_mb:.2f}MB")
-                if size_mb > max_size_mb:
-                    return None, f"Fichier trop volumineux: {size_mb:.1f}MB > {max_size_mb}MB"
-                elif size_mb < 0.001:  # Moins de 1KB
-                    logger.warning(f"⚠️ Fichier très petit selon headers: {size_mb:.6f}MB")
+        content_length = head_response.headers.get('content-length')
+        if content_length:
+            size_mb = int(content_length) / (1024 * 1024)
+            if size_mb > max_size_mb:
+                return None, f"Fichier trop volumineux: {size_mb:.1f}MB > {max_size_mb}MB"
         
-        # Téléchargement avec diagnostics
-        logger.info("⬇️ Début GET request...")
-        response = requests.get(audio_url, timeout=120, stream=True, allow_redirects=True)
-        logger.info(f"📊 Status GET: {response.status_code}")
-        logger.info(f"📋 Headers GET: {dict(response.headers)}")
-        
+        # Téléchargement
+        response = requests.get(audio_url, timeout=120, stream=True)
         response.raise_for_status()
         
-        # Déterminer l'extension avec plus de debug
+        # Déterminer l'extension
         content_type = response.headers.get('content-type', '')
-        content_length_get = response.headers.get('content-length', 'unknown')
-        logger.info(f"🎵 Content-Type: {content_type}")
-        logger.info(f"📏 Content-Length GET: {content_length_get}")
-        
-        if 'audio/wav' in content_type or 'audio/x-wav' in content_type:
+        if 'audio/wav' in content_type:
             ext = '.wav'
         elif 'audio/mpeg' in content_type or 'audio/mp3' in content_type:
             ext = '.mp3'
         elif 'audio/mp4' in content_type or 'audio/m4a' in content_type:
             ext = '.m4a'
         else:
-            # Fallback basé sur l'URL
             parsed_url = urlparse(audio_url)
             path_ext = os.path.splitext(parsed_url.path)[1].lower()
             ext = path_ext if path_ext in ['.wav', '.mp3', '.m4a', '.aac', '.flac'] else '.wav'
-            logger.info(f"🔍 Extension fallback depuis URL: {ext}")
         
-        # Sauvegarder dans un fichier temporaire avec compteur
+        # Sauvegarder dans un fichier temporaire
         with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp_file:
             downloaded_size = 0
-            chunk_count = 0
-            
-            logger.info("💾 Début écriture fichier...")
-            
             for chunk in response.iter_content(chunk_size=8192):
                 if chunk:
                     tmp_file.write(chunk)
                     downloaded_size += len(chunk)
-                    chunk_count += 1
-                    
-                    # Log régulier pour les petits fichiers aussi
-                    if chunk_count % 10 == 0:
-                        logger.info(f"📦 Chunk {chunk_count}: {downloaded_size} bytes...")
-                    
                     if downloaded_size > max_size_mb * 1024 * 1024:
                         tmp_file.close()
                         os.unlink(tmp_file.name)
@@ -308,93 +178,99 @@ def download_audio(audio_url, max_size_mb=100):
             
             temp_path = tmp_file.name
         
-        # Vérification finale du fichier
-        final_size = os.path.getsize(temp_path)
-        logger.info(f"✅ Téléchargement terminé:")
-        logger.info(f"   📁 Chemin: {temp_path}")
-        logger.info(f"   📏 Taille finale: {final_size} bytes ({final_size/1024/1024:.2f}MB)")
-        logger.info(f"   📦 Chunks reçus: {chunk_count}")
-        
-        # Validation du fichier téléchargé
-        if final_size == 0:
-            os.unlink(temp_path)
-            return None, "Fichier téléchargé vide (0 bytes)"
-        
-        if final_size < 44:  # En dessous de la taille d'un header WAV minimal
-            logger.warning(f"⚠️ Fichier très petit: {final_size} bytes")
-            
-        # Vérification du contenu
-        try:
-            with open(temp_path, 'rb') as f:
-                header = f.read(12)
-                logger.info(f"🔍 Header fichier (hex): {header.hex()}")
-                logger.info(f"🔍 Header fichier (ascii): {header}")
-                
-                # Vérifications spécifiques par format
-                if ext == '.wav':
-                    if not header.startswith(b'RIFF'):
-                        logger.warning("⚠️ Fichier .wav sans header RIFF - format suspect")
-                    else:
-                        logger.info("✅ Header WAV valide détecté")
-                elif ext == '.mp3':
-                    if not (header.startswith(b'ID3') or header[0:2] == b'\xff\xfb'):
-                        logger.warning("⚠️ Fichier .mp3 sans header valide")
-                    else:
-                        logger.info("✅ Header MP3 valide détecté")
-                        
-        except Exception as validation_error:
-            logger.warning(f"⚠️ Validation header échouée: {validation_error}")
-        
+        logger.info(f"✅ Téléchargé: {downloaded_size/1024/1024:.1f}MB -> {temp_path}")
         return temp_path, None
         
     except Exception as e:
         logger.error(f"❌ Erreur téléchargement: {e}")
-        import traceback
-        logger.error(f"🔍 Traceback: {traceback.format_exc()}")
         return None, str(e)
 
 def transcribe_with_whisper(audio_path):
     """ÉTAPE 1: Transcription seule avec Whisper"""
     try:
-        logger.info("🎯 ÉTAPE 1: Transcription Whisper large-v2...")
+        logger.info("🎯 ÉTAPE 1: Transcription Whisper...")
         
-        result = whisper_model.transcribe(
-            audio_path,
-            language='fr',
-            fp16=torch.cuda.is_available(),
-            condition_on_previous_text=False,
-            no_speech_threshold=0.6,
-            logprob_threshold=-1.0,
-            compression_ratio_threshold=2.4,
-            temperature=0.0,
-            verbose=False,
-            word_timestamps=True
-        )
+        if not os.path.exists(audio_path):
+            return {'success': False, 'error': f'Fichier audio introuvable: {audio_path}'}
         
-        logger.info(f"✅ Transcription terminée: {len(result['segments'])} segments")
+        file_size = os.path.getsize(audio_path)
+        logger.info(f"📁 Taille fichier: {file_size} bytes ({file_size/1024/1024:.2f}MB)")
+        
+        if file_size == 0:
+            return {'success': False, 'error': 'Fichier audio vide'}
+        
+        logger.info("🎯 Lancement transcription...")
+        
+        try:
+            # Méthode principale
+            result = whisper_model.transcribe(
+                audio_path,
+                language='fr',
+                fp16=torch.cuda.is_available(),
+                condition_on_previous_text=False,
+                no_speech_threshold=0.6,
+                logprob_threshold=-1.0,
+                compression_ratio_threshold=2.4,
+                temperature=0.0,
+                verbose=False
+            )
+            
+        except Exception as whisper_error:
+            logger.warning(f"⚠️ Erreur transcription standard: {whisper_error}")
+            
+            # FALLBACK: Méthode simplifiée
+            logger.info("🔄 Tentative transcription simplifiée...")
+            try:
+                result = whisper_model.transcribe(
+                    audio_path,
+                    language='fr',
+                    verbose=False
+                )
+            except Exception as whisper_error2:
+                logger.error(f"❌ Échec transcription simplifiée: {whisper_error2}")
+                
+                # FALLBACK 2: Transcription minimale
+                logger.info("🔄 Tentative transcription minimale...")
+                try:
+                    result = whisper_model.transcribe(audio_path)
+                except Exception as whisper_error3:
+                    return {
+                        'success': False,
+                        'error': f'Échec total transcription: {whisper_error3}'
+                    }
+        
+        logger.info(f"📊 Transcription réussie:")
+        logger.info(f"   📝 Texte: '{result.get('text', '')[:100]}...'")
+        logger.info(f"   🌍 Langue: {result.get('language', 'unknown')}")
+        logger.info(f"   📈 Segments: {len(result.get('segments', []))}")
         
         # Nettoyage des segments
+        segments_raw = result.get("segments", [])
         cleaned_segments = []
-        for segment in result["segments"]:
-            text = segment["text"].strip()
+        
+        for segment in segments_raw:
+            text = segment.get("text", "").strip()
             if text:
                 cleaned_segments.append({
-                    "start": segment["start"],
-                    "end": segment["end"],
+                    "start": segment.get("start", 0),
+                    "end": segment.get("end", 0),
                     "text": text,
                     "confidence": 1 - segment.get("no_speech_prob", 0),
                     "words": segment.get("words", [])
                 })
         
+        logger.info(f"✅ Transcription terminée: {len(cleaned_segments)} segments utiles")
+        
         return {
             'success': True,
-            'transcription': result["text"],
+            'transcription': result.get("text", ""),
             'segments': cleaned_segments,
             'language': result.get("language", "fr")
         }
         
     except Exception as e:
-        logger.error(f"❌ Erreur transcription: {e}")
+        logger.error(f"❌ Erreur transcription globale: {e}")
+        logger.error(f"🔍 Traceback: {traceback.format_exc()}")
         return {
             'success': False,
             'error': str(e)
@@ -411,7 +287,6 @@ def diarize_with_pyannote(audio_path, num_speakers=None, min_speakers=2, max_spe
         
         logger.info("👥 ÉTAPE 2: Diarisation pyannote...")
         
-        # Paramètres optimisés
         diarization_params = {}
         
         if num_speakers and num_speakers > 0:
@@ -422,7 +297,6 @@ def diarize_with_pyannote(audio_path, num_speakers=None, min_speakers=2, max_spe
             diarization_params['max_speakers'] = min(6, max_speakers)
             logger.info(f"🔍 Auto-détection: {diarization_params['min_speakers']}-{diarization_params['max_speakers']} speakers")
         
-        # Exécution de la diarisation
         try:
             diarization = diarization_pipeline(audio_path, **diarization_params)
             logger.info("✅ Diarisation terminée")
@@ -445,7 +319,6 @@ def diarize_with_pyannote(audio_path, num_speakers=None, min_speakers=2, max_spe
             })
             speakers_found.add(speaker)
         
-        # Tri par temps de début
         speaker_segments.sort(key=lambda x: x["start"])
         
         logger.info(f"👥 Speakers trouvés: {sorted(list(speakers_found))}")
@@ -477,7 +350,6 @@ def assign_speakers_to_transcription(transcription_segments, speaker_segments):
         trans_center = (trans_start + trans_end) / 2
         trans_duration = trans_end - trans_start
         
-        # Trouver le speaker qui couvre le centre du segment
         best_speaker = None
         best_coverage = 0
         
@@ -485,9 +357,7 @@ def assign_speakers_to_transcription(transcription_segments, speaker_segments):
             spk_start = spk_seg["start"]
             spk_end = spk_seg["end"]
             
-            # Vérifier si le centre du segment de transcription est dans ce segment de speaker
             if spk_start <= trans_center <= spk_end:
-                # Calculer le pourcentage de recouvrement
                 overlap_start = max(trans_start, spk_start)
                 overlap_end = min(trans_end, spk_end)
                 overlap = max(0, overlap_end - overlap_start)
@@ -497,7 +367,6 @@ def assign_speakers_to_transcription(transcription_segments, speaker_segments):
                     best_coverage = coverage
                     best_speaker = spk_seg["speaker"]
         
-        # Si aucun speaker trouvé avec le centre, prendre celui avec le plus de recouvrement
         if not best_speaker:
             for spk_seg in speaker_segments:
                 spk_start = spk_seg["start"]
@@ -512,7 +381,6 @@ def assign_speakers_to_transcription(transcription_segments, speaker_segments):
                     best_coverage = coverage
                     best_speaker = spk_seg["speaker"]
         
-        # Attribution finale
         if not best_speaker:
             best_speaker = "SPEAKER_UNKNOWN"
             best_coverage = 0
@@ -527,7 +395,6 @@ def assign_speakers_to_transcription(transcription_segments, speaker_segments):
             "words": trans_seg.get("words", [])
         })
     
-    # Post-traitement: lissage des changements de speakers
     final_segments = smooth_speaker_transitions(final_segments)
     
     speakers_assigned = len(set(seg["speaker"] for seg in final_segments if seg["speaker"] != "SPEAKER_UNKNOWN"))
@@ -550,7 +417,6 @@ def smooth_speaker_transitions(segments, min_segment_duration=1.0, confidence_th
         
         current_duration = current["end"] - current["start"]
         
-        # Conditions pour le lissage
         if (current_duration < min_segment_duration and
             prev_seg["speaker"] == next_seg["speaker"] and
             current["speaker"] != prev_seg["speaker"] and
@@ -583,7 +449,6 @@ def transcribe_and_diarize_separated(audio_path, num_speakers=None, min_speakers
         )
         
         if not diarization_result['success']:
-            # Retourner transcription seule si diarisation échoue
             logger.warning("⚠️ Diarisation échouée - retour transcription seule")
             segments_without_speakers = []
             for segment in transcription_result["segments"]:
@@ -691,7 +556,6 @@ def create_formatted_transcript(segments):
             lines.append(f"\n👤 {segment['speaker']} prend la parole:")
             current_speaker = segment["speaker"]
         
-        # Indicateurs de qualité
         quality_icons = ""
         if segment.get("smoothed"):
             quality_icons += "🔧"
@@ -703,9 +567,9 @@ def create_formatted_transcript(segments):
     return "\n".join(lines)
 
 def handler(event):
-    """Handler principal RunPod avec processus séparés - Optimisé"""
+    """Handler principal RunPod avec processus séparés"""
     try:
-        # Chargement des modèles seulement si nécessaire (évite rate limits)
+        # Chargement des modèles seulement si nécessaire
         if whisper_model is None or diarization_pipeline is None:
             logger.info("🔄 Chargement modèles manquants...")
             load_models()
@@ -782,12 +646,10 @@ def handler(event):
         
     except Exception as e:
         logger.error(f"❌ Erreur handler: {e}")
-        import traceback
         logger.error(f"🔍 Traceback: {traceback.format_exc()}")
         return {"error": f"Erreur interne: {str(e)}"}
 
 if __name__ == "__main__":
-    # Pré-chargement des modèles au démarrage pour éviter rate limits
     logger.info("🚀 Démarrage RunPod Serverless - Transcription + Diarisation SÉPARÉE")
     logger.info("⏳ Chargement initial des modèles...")
     
