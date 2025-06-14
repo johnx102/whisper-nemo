@@ -58,8 +58,7 @@ RUN pip install --no-cache-dir \
 
 # ÉTAPE 4: Essayer NeMo version stable
 RUN pip install --no-cache-dir nemo-toolkit[asr]==2.0.0
-    echo "Warning: NeMo installation failed"
-
+  
 # ÉTAPE 5: Repos Git nécessaires (installation conditionnelle)
 RUN pip install --no-cache-dir \
     git+https://github.com/MahmoudAshraf97/demucs.git || echo "Demucs failed" && \
