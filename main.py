@@ -146,6 +146,7 @@ class TranscriptionResponse(BaseModel):
 def create_nemo_config(temp_dir: str, audio_path: str, max_speakers: int = 8):
     """Créer une configuration NeMo optimisée basée sur whisper-diarization"""
     
+    # Configuration inspirée du projet original whisper-diarization
     config_content = f"""
 device: cuda
 
@@ -181,8 +182,8 @@ diarizer:
   speaker_embeddings:
     model_path: titanet_large
     parameters:
-      window_length_in_sec: [1.5]
-      shift_length_in_sec: [0.75]
+      window_length_in_sec: 1.5
+      shift_length_in_sec: 0.75
       multiscale_weights: [1, 1, 1, 1, 1]
       multiscale_args:
         scale_dict:
@@ -196,6 +197,12 @@ diarizer:
         f.write(config_content)
     
     print(f"✅ NeMo config created: {config_path}")
+    
+    # Debug: afficher la config pour vérifier
+    print("🔍 NeMo config content:")
+    with open(config_path, 'r') as f:
+        print(f.read())
+    
     return config_path
 
 def convert_audio_to_mono(audio_path: str, temp_dir: str) -> str:
@@ -322,23 +329,106 @@ def perform_nemo_diarization(audio_path: str, temp_dir: str, max_speakers: int =
         # Créer le manifest
         manifest_path = create_manifest(mono_audio, temp_dir)
         
-        # Créer la config
-        config_path = create_nemo_config(temp_dir, mono_audio, max_speakers)
+        # Créer la config - ESSAYER AVEC helpers.create_config D'ABORD
+        config_path = None
+        
+        if HELPERS_AVAILABLE:
+            try:
+                print("🔧 Trying helpers.create_config...")
+                from helpers import create_config
+                config_path = create_config(temp_dir)
+                
+                # Modifier la config pour nos paramètres
+                from omegaconf import OmegaConf
+                cfg = OmegaConf.load(config_path)
+                cfg.diarizer.manifest_filepath = manifest_path
+                cfg.diarizer.out_dir = temp_dir
+                cfg.diarizer.clustering.parameters.max_num_speakers = max_speakers
+                
+                # Sauvegarder la config modifiée
+                OmegaConf.save(cfg, config_path)
+                print("✅ Using helpers.create_config with modifications")
+                
+            except Exception as e:
+                print(f"⚠️ helpers.create_config failed: {e}")
+                config_path = None
+        
+        # Fallback vers notre config personnalisée
+        if config_path is None:
+            print("🔧 Using custom config...")
+            config_path = create_nemo_config(temp_dir, mono_audio, max_speakers)
         
         # Charger la config
         from omegaconf import OmegaConf
         cfg = OmegaConf.load(config_path)
         
+        print(f"🔍 Config loaded. Keys: {list(cfg.keys())}")
+        print(f"🔍 Diarizer keys: {list(cfg.diarizer.keys())}")
+        
         # Créer et lancer le diarizer
         print("🏗️ Creating NeMo diarizer...")
         device = "cuda" if torch.cuda.is_available() else "cpu"
         
-        msdd_model = NeuralDiarizer(cfg=cfg)
+        # IMPORTANT: S'assurer que le device est correctement configuré
         if device == "cuda":
-            msdd_model = msdd_model.to(device)
+            cfg.device = "cuda"
         
-        print("🎯 Starting diarization process...")
-        msdd_model.diarize()
+        try:
+            msdd_model = NeuralDiarizer(cfg=cfg)
+            if device == "cuda":
+                msdd_model = msdd_model.to(device)
+            
+            print("🎯 Starting diarization process...")
+            msdd_model.diarize()
+            
+        except Exception as nemo_error:
+            print(f"❌ NeuralDiarizer creation/execution failed: {nemo_error}")
+            
+            # ESSAYER UNE APPROCHE ALTERNATIVE
+            print("🔄 Trying alternative NeMo approach...")
+            
+            # Créer une config plus simple
+            simple_config = f"""
+device: {device}
+
+diarizer:
+  manifest_filepath: {manifest_path}
+  out_dir: {temp_dir}
+  oracle_vad: false
+  clustering:
+    parameters:
+      oracle_num_speakers: false
+      max_num_speakers: {max_speakers}
+  msdd_model:
+    model_path: diar_msdd_telephonic
+    parameters:
+      use_speaker_model_from_ckpt: true
+      infer_batch_size: 16
+      sigmoid_threshold: [0.7]
+  vad:
+    model_path: vad_multilingual_marblenet
+    parameters:
+      onset: 0.8
+      offset: 0.6
+  speaker_embeddings:
+    model_path: titanet_large
+    parameters:
+      window_length_in_sec: 1.5
+      shift_length_in_sec: 0.75
+"""
+            
+            simple_config_path = os.path.join(temp_dir, 'simple_config.yaml')
+            with open(simple_config_path, 'w') as f:
+                f.write(simple_config)
+            
+            # Réessayer avec la config simplifiée
+            cfg_simple = OmegaConf.load(simple_config_path)
+            msdd_model = NeuralDiarizer(cfg=cfg_simple)
+            if device == "cuda":
+                msdd_model = msdd_model.to(device)
+            
+            print("🎯 Starting diarization with simple config...")
+            msdd_model.diarize()
         
         # Lire les résultats RTTM
         pred_rttm_dir = os.path.join(temp_dir, 'pred_rttms')
@@ -346,6 +436,12 @@ def perform_nemo_diarization(audio_path: str, temp_dir: str, max_speakers: int =
         pred_rttm = os.path.join(pred_rttm_dir, f'{audio_basename}.rttm')
         
         print(f"🔍 Looking for RTTM: {pred_rttm}")
+        
+        # Debug: lister les fichiers créés
+        if os.path.exists(temp_dir):
+            print(f"📁 Files in temp_dir: {os.listdir(temp_dir)}")
+        if os.path.exists(pred_rttm_dir):
+            print(f"📁 Files in pred_rttms: {os.listdir(pred_rttm_dir)}")
         
         if os.path.exists(pred_rttm):
             speaker_timestamps = []
