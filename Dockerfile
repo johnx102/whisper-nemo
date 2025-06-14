@@ -1,5 +1,5 @@
 # Image de base avec CUDA support optimisée pour serverless
-FROM runpod/pytorch:2.1.0-py3.10-cuda11.8.0-devel-ubuntu22.04
+FROM runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04
 
 # Variables d'environnement
 ENV DEBIAN_FRONTEND=noninteractive
@@ -30,7 +30,6 @@ WORKDIR /app
 COPY requirements.txt .
 
 # Installation des dépendances Python avec optimisations
-RUN pip install torch==2.7.0 torchaudio==2.7.0+cu118 --index-url https://download.pytorch.org/whl/cu118
 RUN pip install -r requirements.txt
 
 # Copier le code source
