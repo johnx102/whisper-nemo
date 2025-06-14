@@ -1,33 +1,30 @@
-from flask import Flask, request, jsonify
-from flask_cors import CORS
+import runpod
 import whisper
 from pyannote.audio import Pipeline
 import os
 import tempfile
 import logging
 from datetime import timedelta
-import numpy as np
 import torch
-
-app = Flask(__name__)
-CORS(app)
+import requests
+import json
+from urllib.parse import urlparse
 
 # Configuration logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Configuration GPU pour serverless
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+# Configuration GPU
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-logger.info(f"🎮 Device utilisé: {device}")
+logger.info(f"🎮 Device: {device}")
 
 # Optimisations GPU
 if torch.cuda.is_available():
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
-    torch.set_grad_enabled(False)  # Inference seulement
+    torch.set_grad_enabled(False)
     
-    # GPU warmup léger
+    # GPU warmup
     logger.info("🔥 Warmup GPU...")
     x = torch.randn(1000, 1000, device=device)
     y = torch.mm(x, x)
@@ -35,12 +32,12 @@ if torch.cuda.is_available():
     del x, y
     logger.info("✅ GPU warmed up")
 
-# Variables globales pour les modèles
+# Variables globales pour les modèles (chargement au démarrage)
 whisper_model = None
 diarization_pipeline = None
 
 def load_models():
-    """Chargement paresseux des modèles pour optimiser le cold start"""
+    """Chargement des modèles au démarrage du container"""
     global whisper_model, diarization_pipeline
     
     if whisper_model is None:
@@ -51,7 +48,6 @@ def load_models():
     if diarization_pipeline is None:
         logger.info("🔄 Chargement pyannote...")
         try:
-            # Récupération du token Hugging Face depuis l'environnement
             hf_token = os.getenv('HUGGINGFACE_TOKEN')
             logger.info(f"🔑 Token HF trouvé: {'Oui' if hf_token else 'Non'}")
             
@@ -62,17 +58,15 @@ def load_models():
                 )
                 logger.info("✅ pyannote chargé avec token")
             else:
-                # Essayer sans token (ne fonctionnera probablement pas pour pyannote)
                 logger.warning("⚠️ Pas de token HF - tentative sans token")
                 diarization_pipeline = Pipeline.from_pretrained(
                     "pyannote/speaker-diarization-3.1"
                 )
             
-            # Déplacer sur GPU si disponible
             if torch.cuda.is_available():
                 diarization_pipeline.to(device)
+                logger.info("✅ pyannote déplacé sur GPU")
             
-            logger.info("✅ pyannote chargé")
         except Exception as e:
             logger.error(f"❌ Erreur chargement pyannote: {e}")
             logger.info("💡 Astuce: Définir HUGGINGFACE_TOKEN dans les variables d'environnement")
@@ -82,99 +76,170 @@ def format_timestamp(seconds):
     """Convertit les secondes en format mm:ss"""
     return str(timedelta(seconds=int(seconds)))[2:]
 
-def optimize_diarization(audio_path, num_speakers=None, min_speakers=1, max_speakers=4):
-    """Diarization optimisée pour serverless"""
-    if diarization_pipeline is None:
-        raise Exception("Pipeline pyannote non disponible")
-    
-    diarization_params = {}
-    
-    if num_speakers:
-        diarization_params['num_speakers'] = num_speakers
-        logger.info(f"🎯 Forçage à {num_speakers} speakers")
-    else:
-        diarization_params['min_speakers'] = min_speakers
-        diarization_params['max_speakers'] = max_speakers
-        logger.info(f"🔍 Détection entre {min_speakers} et {max_speakers} speakers")
-    
-    diarization = diarization_pipeline(audio_path, **diarization_params)
-    return diarization
-
-def merge_transcription_with_speakers_improved(whisper_segments, diarization):
-    """Fusion améliorée transcription + diarization"""
-    
-    # Convertir diarization en liste
-    speaker_segments = []
-    for turn, _, speaker in diarization.itertracks(yield_label=True):
-        speaker_segments.append({
-            "start": turn.start,
-            "end": turn.end,
-            "speaker": speaker
-        })
-    
-    logger.info(f"👥 Speakers détectés: {len(set(seg['speaker'] for seg in speaker_segments))}")
-    
-    # Associer segments whisper aux speakers
-    merged_segments = []
-    
-    for segment in whisper_segments:
-        seg_start = segment["start"]
-        seg_end = segment["end"]
+def download_audio(audio_url, max_size_mb=100):
+    """Télécharge un fichier audio depuis une URL"""
+    try:
+        logger.info(f"📥 Téléchargement: {audio_url}")
         
-        # Trouver le speaker avec le plus de recouvrement
-        best_speaker = "SPEAKER_UNKNOWN"
-        best_overlap = 0
+        # Vérification préliminaire
+        head_response = requests.head(audio_url, timeout=10)
+        if head_response.status_code != 200:
+            return None, f"URL non accessible: HTTP {head_response.status_code}"
         
-        for spk_seg in speaker_segments:
-            overlap_start = max(seg_start, spk_seg["start"])
-            overlap_end = min(seg_end, spk_seg["end"])
-            overlap = max(0, overlap_end - overlap_start)
+        content_length = head_response.headers.get('content-length')
+        if content_length:
+            size_mb = int(content_length) / (1024 * 1024)
+            if size_mb > max_size_mb:
+                return None, f"Fichier trop volumineux: {size_mb:.1f}MB > {max_size_mb}MB"
+        
+        # Téléchargement
+        response = requests.get(audio_url, timeout=120, stream=True)
+        response.raise_for_status()
+        
+        # Déterminer l'extension
+        content_type = response.headers.get('content-type', '')
+        if 'audio/wav' in content_type:
+            ext = '.wav'
+        elif 'audio/mpeg' in content_type or 'audio/mp3' in content_type:
+            ext = '.mp3'
+        elif 'audio/mp4' in content_type or 'audio/m4a' in content_type:
+            ext = '.m4a'
+        else:
+            # Fallback basé sur l'URL
+            parsed_url = urlparse(audio_url)
+            path_ext = os.path.splitext(parsed_url.path)[1].lower()
+            ext = path_ext if path_ext in ['.wav', '.mp3', '.m4a', '.aac', '.flac'] else '.wav'
+        
+        # Sauvegarder dans un fichier temporaire
+        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp_file:
+            downloaded_size = 0
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    tmp_file.write(chunk)
+                    downloaded_size += len(chunk)
+                    # Vérification de taille pendant le téléchargement
+                    if downloaded_size > max_size_mb * 1024 * 1024:
+                        tmp_file.close()
+                        os.unlink(tmp_file.name)
+                        return None, f"Fichier trop volumineux pendant téléchargement"
             
-            if overlap > best_overlap:
-                best_overlap = overlap
-                best_speaker = spk_seg["speaker"]
+            temp_path = tmp_file.name
         
-        merged_segments.append({
-            "start": seg_start,
-            "end": seg_end,
-            "duration": seg_end - seg_start,
-            "speaker": best_speaker,
-            "text": segment["text"].strip(),
-            "confidence": 1 - segment.get("no_speech_prob", 0),
-            "overlap_quality": best_overlap / (seg_end - seg_start) if seg_end > seg_start else 0
-        })
-    
-    # Lissage des transitions
-    merged_segments = smooth_speaker_transitions(merged_segments)
-    
-    return merged_segments
+        logger.info(f"✅ Téléchargé: {downloaded_size/1024/1024:.1f}MB -> {temp_path}")
+        return temp_path, None
+        
+    except Exception as e:
+        logger.error(f"❌ Erreur téléchargement: {e}")
+        return None, str(e)
 
-def smooth_speaker_transitions(segments):
-    """Lisse les changements de speakers trop fréquents"""
-    if len(segments) < 3:
-        return segments
-    
-    smoothed = segments.copy()
-    
-    for i in range(1, len(smoothed) - 1):
-        current = smoothed[i]
-        prev_speaker = smoothed[i-1]["speaker"]
-        next_speaker = smoothed[i+1]["speaker"]
+def transcribe_and_diarize(audio_path, num_speakers=None, min_speakers=1, max_speakers=4):
+    """Effectue la transcription et diarization"""
+    try:
+        # Transcription avec Whisper
+        logger.info("🎯 Transcription Whisper...")
+        transcription_result = whisper_model.transcribe(
+            audio_path,
+            language='fr',
+            fp16=torch.cuda.is_available(),
+            condition_on_previous_text=False,
+            no_speech_threshold=0.6,
+            temperature=0.0,
+            verbose=False
+        )
         
-        # Si segment court entre même speaker
-        if (current["duration"] < 2.0 and 
-            prev_speaker == next_speaker and 
-            current["speaker"] != prev_speaker and
-            current["overlap_quality"] < 0.8):
+        if not diarization_pipeline:
+            # Retour sans diarization si pyannote non disponible
+            logger.warning("⚠️ Diarization indisponible - retour transcription seule")
+            segments_with_speakers = []
+            for segment in transcription_result["segments"]:
+                segments_with_speakers.append({
+                    "start": segment["start"],
+                    "end": segment["end"],
+                    "text": segment["text"].strip(),
+                    "speaker": "SPEAKER_00",
+                    "confidence": 1 - segment.get("no_speech_prob", 0)
+                })
             
-            logger.info(f"🔧 Lissage: '{current['text'][:30]}...' -> {prev_speaker}")
-            smoothed[i]["speaker"] = prev_speaker
-            smoothed[i]["smoothed"] = True
-    
-    return smoothed
+            return {
+                'success': True,
+                'transcription': transcription_result["text"],
+                'segments': segments_with_speakers,
+                'speakers_detected': 1,
+                'language': transcription_result.get("language", "fr"),
+                'diarization_available': False
+            }
+        
+        # Diarization avec pyannote
+        logger.info("👥 Diarization pyannote...")
+        diarization_params = {}
+        if num_speakers:
+            diarization_params['num_speakers'] = num_speakers
+        else:
+            diarization_params['min_speakers'] = min_speakers
+            diarization_params['max_speakers'] = max_speakers
+        
+        diarization = diarization_pipeline(audio_path, **diarization_params)
+        
+        # Conversion diarization en segments
+        speaker_segments = []
+        for turn, _, speaker in diarization.itertracks(yield_label=True):
+            speaker_segments.append({
+                "start": turn.start,
+                "end": turn.end,
+                "speaker": speaker
+            })
+        
+        # Fusion transcription + diarization
+        logger.info("🔗 Fusion transcription + diarization...")
+        merged_segments = []
+        
+        for segment in transcription_result["segments"]:
+            seg_start = segment["start"]
+            seg_end = segment["end"]
+            
+            # Trouver le speaker avec le plus de recouvrement
+            best_speaker = "SPEAKER_UNKNOWN"
+            best_overlap = 0
+            
+            for spk_seg in speaker_segments:
+                overlap_start = max(seg_start, spk_seg["start"])
+                overlap_end = min(seg_end, spk_seg["end"])
+                overlap = max(0, overlap_end - overlap_start)
+                
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    best_speaker = spk_seg["speaker"]
+            
+            merged_segments.append({
+                "start": seg_start,
+                "end": seg_end,
+                "text": segment["text"].strip(),
+                "speaker": best_speaker,
+                "confidence": 1 - segment.get("no_speech_prob", 0)
+            })
+        
+        speakers_detected = len(set(seg["speaker"] for seg in merged_segments if seg["speaker"] != "SPEAKER_UNKNOWN"))
+        
+        logger.info(f"✅ Transcription + Diarization terminée - {speakers_detected} speakers détectés")
+        
+        return {
+            'success': True,
+            'transcription': transcription_result["text"],
+            'segments': merged_segments,
+            'speakers_detected': speakers_detected,
+            'language': transcription_result.get("language", "fr"),
+            'diarization_available': True
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Erreur transcription/diarization: {e}")
+        return {
+            'success': False,
+            'error': str(e)
+        }
 
-def create_readable_transcript(segments):
-    """Créer un transcript lisible avec statistiques"""
+def create_formatted_transcript(segments):
+    """Crée un transcript formaté avec speakers"""
     if not segments:
         return "Aucune transcription disponible."
     
@@ -186,36 +251,28 @@ def create_readable_transcript(segments):
             speaker_stats[speaker] = {
                 "total_time": 0,
                 "segments_count": 0,
-                "texts": [],
-                "avg_confidence": 0
+                "texts": []
             }
         
-        speaker_stats[speaker]["total_time"] += segment["duration"]
+        duration = segment["end"] - segment["start"]
+        speaker_stats[speaker]["total_time"] += duration
         speaker_stats[speaker]["segments_count"] += 1
         speaker_stats[speaker]["texts"].append(segment["text"])
-        speaker_stats[speaker]["avg_confidence"] += segment["confidence"]
     
-    # Calculer moyennes et pourcentages
-    total_duration = segments[-1]["end"] if segments else 0
-    for speaker in speaker_stats:
-        stats = speaker_stats[speaker]
-        stats["avg_confidence"] /= stats["segments_count"]
-        stats["percentage"] = (stats["total_time"] / total_duration * 100) if total_duration > 0 else 0
-    
-    # Générer le transcript formaté
+    # Créer le transcript
     lines = ["=== TRANSCRIPTION AVEC DIARIZATION ===\n"]
     
     # Statistiques
-    lines.append("📊 ANALYSE DES PARTICIPANTS:")
+    lines.append("📊 PARTICIPANTS:")
+    total_duration = segments[-1]["end"] if segments else 0
     for speaker, stats in speaker_stats.items():
-        conf = int(stats["avg_confidence"] * 100)
-        time_str = f"{stats['total_time']:.1f}s"
-        percentage = f"{stats['percentage']:.1f}%"
-        lines.append(f"🗣️ {speaker}: {time_str} ({percentage}) - Confiance: {conf}%")
+        percentage = (stats["total_time"] / total_duration * 100) if total_duration > 0 else 0
+        lines.append(f"🗣️ {speaker}: {stats['total_time']:.1f}s ({percentage:.1f}%)")
     
     lines.append("\n" + "="*50)
     lines.append("📝 CONVERSATION:")
     
+    # Format conversation
     current_speaker = None
     for segment in segments:
         start_time = format_timestamp(segment["start"])
@@ -226,163 +283,97 @@ def create_readable_transcript(segments):
             lines.append(f"\n👤 {segment['speaker']}:")
             current_speaker = segment["speaker"]
         
-        quality_icon = "🔧" if segment.get("smoothed") else ""
-        lines.append(f"[{start_time}-{end_time}] {segment['text']} ({confidence}%) {quality_icon}")
+        lines.append(f"[{start_time}-{end_time}] {segment['text']} ({confidence}%)")
     
     return "\n".join(lines)
 
-@app.route('/', methods=['GET'])
-def home():
-    """Endpoint de santé"""
-    return jsonify({
-        "status": "API Transcription + Diarization",
-        "version": "4.0-serverless",
-        "gpu_available": torch.cuda.is_available(),
-        "device": str(device),
-        "endpoints": {
-            "/transcribe": "POST - Transcription simple",
-            "/process": "POST - Transcription + Diarization complète"
+def handler(event):
+    """
+    Handler principal pour RunPod Serverless
+    Format d'entrée attendu:
+    {
+        "input": {
+            "audio_url": "https://example.com/audio.wav",
+            "num_speakers": 2,  # optionnel
+            "min_speakers": 1,  # optionnel
+            "max_speakers": 4   # optionnel
         }
-    })
-
-@app.route('/health', methods=['GET'])
-def health():
-    """Health check pour serverless"""
-    return jsonify({"status": "healthy"}), 200
-
-@app.route('/transcribe', methods=['POST'])
-def transcribe():
-    """Transcription simple avec Whisper"""
+    }
+    """
     try:
-        # Chargement paresseux
+        # Chargement des modèles si pas encore fait
         load_models()
         
-        if 'audio' not in request.files:
-            return jsonify({"error": "Fichier audio manquant"}), 400
+        # Extraction des paramètres
+        job_input = event.get("input", {})
+        audio_url = job_input.get("audio_url")
         
-        file = request.files['audio']
-        logger.info(f"📁 Transcription: {file.filename}")
+        if not audio_url:
+            return {
+                "error": "Paramètre 'audio_url' manquant dans input"
+            }
         
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as tmp:
-            file.save(tmp.name)
-            
-            # Paramètres optimisés pour serverless
-            result = whisper_model.transcribe(
-                tmp.name,
-                language='fr',
-                fp16=torch.cuda.is_available(),
-                condition_on_previous_text=False,
-                no_speech_threshold=0.6,
-                temperature=0.0,
-                verbose=False
-            )
-            
-            os.unlink(tmp.name)
+        num_speakers = job_input.get("num_speakers")
+        min_speakers = job_input.get("min_speakers", 1)
+        max_speakers = job_input.get("max_speakers", 4)
         
-        return jsonify({
-            "success": True,
-            "transcription": result["text"],
-            "segments": result["segments"],
-            "model": "large-v2",
-            "language": result.get("language", "fr"),
-            "device": str(device)
-        })
+        logger.info(f"🚀 Début traitement: {audio_url}")
+        logger.info(f"👥 Paramètres speakers: num={num_speakers}, min={min_speakers}, max={max_speakers}")
         
-    except Exception as e:
-        logger.error(f"❌ Erreur transcription: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/process', methods=['POST'])
-def process_with_diarization():
-    """Transcription + Diarization complète"""
-    try:
-        # Chargement paresseux
-        load_models()
+        # Téléchargement du fichier audio
+        audio_path, download_error = download_audio(audio_url)
+        if download_error:
+            return {
+                "error": f"Erreur téléchargement: {download_error}"
+            }
         
-        if diarization_pipeline is None:
-            return jsonify({
-                "error": "Pipeline diarization non disponible. Vérifiez HUGGINGFACE_TOKEN."
-            }), 500
-        
-        if 'audio' not in request.files:
-            return jsonify({"error": "Fichier audio manquant"}), 400
-        
-        file = request.files['audio']
-        
-        # Paramètres optionnels
-        num_speakers = request.form.get('num_speakers', type=int)
-        min_speakers = request.form.get('min_speakers', 1, type=int)
-        max_speakers = request.form.get('max_speakers', 4, type=int)
-        
-        logger.info(f"📁 Traitement complet: {file.filename}")
-        
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as tmp:
-            file.save(tmp.name)
-            
-            # Transcription
-            logger.info("🎯 Transcription...")
-            transcription = whisper_model.transcribe(
-                tmp.name,
-                language='fr',
-                fp16=torch.cuda.is_available(),
-                condition_on_previous_text=False,
-                no_speech_threshold=0.6,
-                temperature=0.0,
-                verbose=False
-            )
-            
-            # Diarization
-            logger.info("👥 Diarization...")
-            diarization = optimize_diarization(
-                tmp.name,
+        try:
+            # Transcription + Diarization
+            result = transcribe_and_diarize(
+                audio_path,
                 num_speakers=num_speakers,
                 min_speakers=min_speakers,
                 max_speakers=max_speakers
             )
             
-            # Fusion
-            logger.info("🔗 Fusion...")
-            merged_segments = merge_transcription_with_speakers_improved(
-                transcription["segments"],
-                diarization
-            )
+            if not result['success']:
+                return {
+                    "error": f"Erreur traitement: {result.get('error', 'Erreur inconnue')}"
+                }
             
-            # Transcript formaté
-            readable_transcript = create_readable_transcript(merged_segments)
+            # Création du transcript formaté
+            formatted_transcript = create_formatted_transcript(result['segments'])
             
-            os.unlink(tmp.name)
-        
-        speakers_detected = len(set(seg["speaker"] for seg in merged_segments 
-                                  if seg["speaker"] != "SPEAKER_UNKNOWN"))
-        
-        return jsonify({
-            "success": True,
-            "model": "large-v2",
-            "device": str(device),
-            "transcription_brute": transcription["text"],
-            "transcription_formatee": readable_transcript,
-            "segments_detailles": merged_segments,
-            "parametres": {
-                "num_speakers_force": num_speakers,
-                "min_speakers": min_speakers,
-                "max_speakers": max_speakers
-            },
-            "statistiques": {
-                "speakers_detectes": speakers_detected,
-                "speakers_inconnus": len([seg for seg in merged_segments 
-                                        if seg["speaker"] == "SPEAKER_UNKNOWN"]),
-                "duree_totale": f"{max(seg['end'] for seg in merged_segments) if merged_segments else 0:.1f}s",
-                "nombre_segments": len(merged_segments),
-                "confiance_moyenne": f"{sum(seg['confidence'] for seg in merged_segments) / len(merged_segments) * 100:.1f}%" if merged_segments else "0%",
-                "segments_lisses": len([seg for seg in merged_segments if seg.get("smoothed")])
+            # Retour au format RunPod
+            return {
+                "transcription": result['transcription'],
+                "transcription_formatee": formatted_transcript,
+                "segments": result['segments'],
+                "speakers_detected": result['speakers_detected'],
+                "language": result['language'],
+                "diarization_available": result['diarization_available'],
+                "device": str(device),
+                "model": "whisper-large-v2",
+                "success": True
             }
-        })
+            
+        finally:
+            # Nettoyage du fichier temporaire
+            if os.path.exists(audio_path):
+                os.unlink(audio_path)
+                logger.info("🗑️ Fichier temporaire supprimé")
         
     except Exception as e:
-        logger.error(f"❌ Erreur traitement: {e}")
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"❌ Erreur handler: {e}")
+        return {
+            "error": f"Erreur interne: {str(e)}"
+        }
 
-if __name__ == '__main__':
-    # Port adapté pour serverless (généralement 8080)
-    port = int(os.environ.get('PORT', 8080))
-    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
+if __name__ == "__main__":
+    # Pré-chargement des modèles au démarrage
+    logger.info("🚀 Démarrage RunPod Serverless - Transcription + Diarization")
+    load_models()
+    logger.info("✅ Modèles chargés - Prêt pour les requêtes")
+    
+    # Démarrage du serveur RunPod
+    runpod.serverless.start({"handler": handler})
