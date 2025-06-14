@@ -1,4 +1,96 @@
-"""
+def transcribe_with_whisper(audio_path):
+    """ÉTAPE 1: Transcription seule avec Whisper - Version robuste"""
+    try:
+        logger.info("🎯 ÉTAPE 1: Transcription Whisper...")
+        
+        # Vérification du fichier
+        if not os.path.exists(audio_path):
+            return {'success': False, 'error': f'Fichier audio introuvable: {audio_path}'}
+        
+        file_size = os.path.getsize(audio_path)
+        logger.info(f"📁 Taille fichier: {file_size} bytes ({file_size/1024/1024:.2f}MB)")
+        
+        if file_size == 0:
+            return {'success': False, 'error': 'Fichier audio vide'}
+        
+        # Transcription avec gestion d'erreur de version
+        logger.info("🎯 Lancement transcription...")
+        
+        try:
+            # Méthode principale
+            result = whisper_model.transcribe(
+                audio_path,
+                language='fr',
+                fp16=torch.cuda.is_available(),
+                condition_on_previous_text=False,
+                no_speech_threshold=0.6,
+                logprob_threshold=-1.0,
+                compression_ratio_threshold=2.4,
+                temperature=0.0,
+                verbose=False
+            )
+            
+        except Exception as whisper_error:
+            logger.warning(f"⚠️ Erreur transcription standard: {whisper_error}")
+            
+            # FALLBACK: Méthode alternative sans certains paramètres
+            logger.info("🔄 Tentative transcription simplifiée...")
+            try:
+                result = whisper_model.transcribe(
+                    audio_path,
+                    language='fr',
+                    verbose=False
+                )
+            except Exception as whisper_error2:
+                logger.error(f"❌ Échec transcription simplifiée: {whisper_error2}")
+                
+                # FALLBACK 2: Transcription sans spécification de langue
+                logger.info("🔄 Tentative transcription minimale...")
+                try:
+                    result = whisper_model.transcribe(audio_path)
+                except Exception as whisper_error3:
+                    return {
+                        'success': False,
+                        'error': f'Échec total transcription: {whisper_error3}'
+                    }
+        
+        logger.info(f"📊 Transcription réussie:")
+        logger.info(f"   📝 Texte: '{result.get('text', '')[:100]}...'")
+        logger.info(f"   🌍 Langue: {result.get('language', 'unknown')}")
+        logger.info(f"   📈 Segments: {len(result.get('segments', []))}")
+        
+        # Nettoyage des segments
+        segments_raw = result.get("segments", [])
+        cleaned_segments = []
+        
+        for segment in segments_raw:
+            text = segment.get("text", "").strip()
+            if text:  # Garder seulement les segments avec du texte
+                cleaned_segments.append({
+                    "start": segment.get("start", 0),
+                    "end": segment.get("end", 0),
+                    "text": text,
+                    "confidence": 1 - segment.get("no_speech_prob", 0),
+                    "words": segment.get("words", [])
+                })
+        
+        logger.info(f"✅ Transcription terminée: {len(cleaned_segments)} segments utiles")
+        
+        return {
+            'success': True,
+            'transcription': result.get("text", ""),
+            'segments': cleaned_segments,
+            'language': result.get("language", "fr")
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Erreur transcription globale: {e}")
+        import traceback
+        logger.error(f"🔍 Traceback: {traceback.format_exc()}")
+        return {
+            'success': False,
+            'error': str(e)
+        }"""
 Handler RunPod Serverless pour Transcription + Diarisation SÉPARÉE
 Amélioration: processus séparés pour de meilleurs résultats
 """
@@ -42,13 +134,24 @@ whisper_model = None
 diarization_pipeline = None
 
 def load_models():
-    """Chargement des modèles - RETOUR À LA LOGIQUE ORIGINALE"""
+    """Chargement des modèles avec gestion du rate limiting HuggingFace"""
     global whisper_model, diarization_pipeline
     
     if whisper_model is None:
         logger.info("🔄 Chargement Whisper large-v2...")
-        whisper_model = whisper.load_model("large-v2", device=device)
-        logger.info("✅ Whisper chargé")
+        try:
+            whisper_model = whisper.load_model("large-v2", device=device)
+            logger.info("✅ Whisper chargé")
+        except Exception as e:
+            logger.error(f"❌ Erreur chargement Whisper: {e}")
+            # Essayer avec une version plus simple si problème
+            try:
+                logger.info("🔄 Tentative Whisper base...")
+                whisper_model = whisper.load_model("base", device=device)
+                logger.info("✅ Whisper base chargé en fallback")
+            except Exception as e2:
+                logger.error(f"❌ Échec total Whisper: {e2}")
+                raise e2
     
     if diarization_pipeline is None:
         logger.info("🔄 Chargement pyannote diarization...")
@@ -60,16 +163,43 @@ def load_models():
                 logger.error("❌ HUGGINGFACE_TOKEN manquant - diarization impossible")
                 return
             
-            # RETOUR À VOTRE CODE ORIGINAL - simple et efficace
+            # GESTION RATE LIMITING : Délai avant requête
+            import time
+            import random
+            delay = random.uniform(2, 5)  # Délai aléatoire pour éviter la concurrence
+            logger.info(f"⏱️ Délai anti-rate-limit: {delay:.1f}s")
+            time.sleep(delay)
+            
             model_name = "pyannote/speaker-diarization-3.1"
-            logger.info(f"📥 Chargement du modèle: {model_name}")
+            logger.info(f"📥 Chargement du modèle avec retry: {model_name}")
             
-            diarization_pipeline = Pipeline.from_pretrained(
-                model_name,
-                use_auth_token=hf_token
-            )
+            # Retry avec backoff exponentiel pour gérer le 429
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    diarization_pipeline = Pipeline.from_pretrained(
+                        model_name,
+                        use_auth_token=hf_token,
+                        cache_dir="/tmp/hf_cache_persistent"  # Cache persistent
+                    )
+                    break  # Succès !
+                    
+                except Exception as e:
+                    error_str = str(e)
+                    if "429" in error_str or "Too Many Requests" in error_str:
+                        wait_time = (2 ** attempt) * 10  # Backoff exponentiel : 10s, 20s, 40s
+                        logger.warning(f"⚠️ Rate limit HF (tentative {attempt+1}/{max_retries}), attente {wait_time}s...")
+                        if attempt < max_retries - 1:
+                            time.sleep(wait_time)
+                            continue
+                        else:
+                            logger.error("❌ Rate limit HF persistant - abandon pyannote")
+                            raise e
+                    else:
+                        # Autre erreur, pas de retry
+                        raise e
             
-            # GPU comme dans votre version
+            # Configuration GPU
             if torch.cuda.is_available():
                 logger.info("🚀 Déplacement du pipeline vers GPU...")
                 diarization_pipeline.to(device)
@@ -84,9 +214,15 @@ def load_models():
             
         except Exception as e:
             logger.error(f"❌ Erreur chargement pyannote: {e}")
-            logger.info("💡 Vérifiez :")
-            logger.info("   - HUGGINGFACE_TOKEN est défini")
-            logger.info("   - Vous avez accepté les conditions: https://huggingface.co/pyannote/speaker-diarization-3.1")
+            if "429" in str(e):
+                logger.info("💡 SOLUTION Rate Limit HuggingFace:")
+                logger.info("   - Attendez quelques minutes avant de relancer")
+                logger.info("   - Redémarrez le container RunPod")
+                logger.info("   - Le service continuera en mode transcription seule")
+            else:
+                logger.info("💡 Vérifiez :")
+                logger.info("   - HUGGINGFACE_TOKEN est défini")
+                logger.info("   - Vous avez accepté les conditions: https://huggingface.co/pyannote/speaker-diarization-3.1")
             diarization_pipeline = None
 
 def format_timestamp(seconds):
@@ -94,28 +230,48 @@ def format_timestamp(seconds):
     return str(timedelta(seconds=int(seconds)))[2:]
 
 def download_audio(audio_url, max_size_mb=100):
-    """Télécharge un fichier audio depuis une URL"""
+    """Télécharge un fichier audio depuis une URL avec diagnostics détaillés"""
     try:
         logger.info(f"📥 Téléchargement: {audio_url}")
         
-        # Vérification préliminaire
-        head_response = requests.head(audio_url, timeout=10)
-        if head_response.status_code != 200:
-            return None, f"URL non accessible: HTTP {head_response.status_code}"
+        # Vérification préliminaire avec plus de détails
+        try:
+            logger.info("🔍 Vérification HEAD request...")
+            head_response = requests.head(audio_url, timeout=10, allow_redirects=True)
+            logger.info(f"📊 Status HEAD: {head_response.status_code}")
+            logger.info(f"📋 Headers HEAD: {dict(head_response.headers)}")
+            
+            if head_response.status_code != 200:
+                logger.warning(f"⚠️ HEAD request non-200, tentative GET quand même...")
+        except Exception as head_error:
+            logger.warning(f"⚠️ HEAD request échoué: {head_error}, continuons avec GET")
+            head_response = None
         
-        content_length = head_response.headers.get('content-length')
-        if content_length:
-            size_mb = int(content_length) / (1024 * 1024)
-            if size_mb > max_size_mb:
-                return None, f"Fichier trop volumineux: {size_mb:.1f}MB > {max_size_mb}MB"
+        if head_response:
+            content_length = head_response.headers.get('content-length')
+            if content_length:
+                size_mb = int(content_length) / (1024 * 1024)
+                logger.info(f"📏 Taille annoncée: {size_mb:.2f}MB")
+                if size_mb > max_size_mb:
+                    return None, f"Fichier trop volumineux: {size_mb:.1f}MB > {max_size_mb}MB"
+                elif size_mb < 0.001:  # Moins de 1KB
+                    logger.warning(f"⚠️ Fichier très petit selon headers: {size_mb:.6f}MB")
         
-        # Téléchargement
-        response = requests.get(audio_url, timeout=120, stream=True)
+        # Téléchargement avec diagnostics
+        logger.info("⬇️ Début GET request...")
+        response = requests.get(audio_url, timeout=120, stream=True, allow_redirects=True)
+        logger.info(f"📊 Status GET: {response.status_code}")
+        logger.info(f"📋 Headers GET: {dict(response.headers)}")
+        
         response.raise_for_status()
         
-        # Déterminer l'extension
+        # Déterminer l'extension avec plus de debug
         content_type = response.headers.get('content-type', '')
-        if 'audio/wav' in content_type:
+        content_length_get = response.headers.get('content-length', 'unknown')
+        logger.info(f"🎵 Content-Type: {content_type}")
+        logger.info(f"📏 Content-Length GET: {content_length_get}")
+        
+        if 'audio/wav' in content_type or 'audio/x-wav' in content_type:
             ext = '.wav'
         elif 'audio/mpeg' in content_type or 'audio/mp3' in content_type:
             ext = '.mp3'
@@ -126,14 +282,25 @@ def download_audio(audio_url, max_size_mb=100):
             parsed_url = urlparse(audio_url)
             path_ext = os.path.splitext(parsed_url.path)[1].lower()
             ext = path_ext if path_ext in ['.wav', '.mp3', '.m4a', '.aac', '.flac'] else '.wav'
+            logger.info(f"🔍 Extension fallback depuis URL: {ext}")
         
-        # Sauvegarder dans un fichier temporaire
+        # Sauvegarder dans un fichier temporaire avec compteur
         with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp_file:
             downloaded_size = 0
+            chunk_count = 0
+            
+            logger.info("💾 Début écriture fichier...")
+            
             for chunk in response.iter_content(chunk_size=8192):
                 if chunk:
                     tmp_file.write(chunk)
                     downloaded_size += len(chunk)
+                    chunk_count += 1
+                    
+                    # Log régulier pour les petits fichiers aussi
+                    if chunk_count % 10 == 0:
+                        logger.info(f"📦 Chunk {chunk_count}: {downloaded_size} bytes...")
+                    
                     if downloaded_size > max_size_mb * 1024 * 1024:
                         tmp_file.close()
                         os.unlink(tmp_file.name)
@@ -141,11 +308,49 @@ def download_audio(audio_url, max_size_mb=100):
             
             temp_path = tmp_file.name
         
-        logger.info(f"✅ Téléchargé: {downloaded_size/1024/1024:.1f}MB -> {temp_path}")
+        # Vérification finale du fichier
+        final_size = os.path.getsize(temp_path)
+        logger.info(f"✅ Téléchargement terminé:")
+        logger.info(f"   📁 Chemin: {temp_path}")
+        logger.info(f"   📏 Taille finale: {final_size} bytes ({final_size/1024/1024:.2f}MB)")
+        logger.info(f"   📦 Chunks reçus: {chunk_count}")
+        
+        # Validation du fichier téléchargé
+        if final_size == 0:
+            os.unlink(temp_path)
+            return None, "Fichier téléchargé vide (0 bytes)"
+        
+        if final_size < 44:  # En dessous de la taille d'un header WAV minimal
+            logger.warning(f"⚠️ Fichier très petit: {final_size} bytes")
+            
+        # Vérification du contenu
+        try:
+            with open(temp_path, 'rb') as f:
+                header = f.read(12)
+                logger.info(f"🔍 Header fichier (hex): {header.hex()}")
+                logger.info(f"🔍 Header fichier (ascii): {header}")
+                
+                # Vérifications spécifiques par format
+                if ext == '.wav':
+                    if not header.startswith(b'RIFF'):
+                        logger.warning("⚠️ Fichier .wav sans header RIFF - format suspect")
+                    else:
+                        logger.info("✅ Header WAV valide détecté")
+                elif ext == '.mp3':
+                    if not (header.startswith(b'ID3') or header[0:2] == b'\xff\xfb'):
+                        logger.warning("⚠️ Fichier .mp3 sans header valide")
+                    else:
+                        logger.info("✅ Header MP3 valide détecté")
+                        
+        except Exception as validation_error:
+            logger.warning(f"⚠️ Validation header échouée: {validation_error}")
+        
         return temp_path, None
         
     except Exception as e:
         logger.error(f"❌ Erreur téléchargement: {e}")
+        import traceback
+        logger.error(f"🔍 Traceback: {traceback.format_exc()}")
         return None, str(e)
 
 def transcribe_with_whisper(audio_path):
@@ -498,10 +703,12 @@ def create_formatted_transcript(segments):
     return "\n".join(lines)
 
 def handler(event):
-    """Handler principal RunPod avec processus séparés"""
+    """Handler principal RunPod avec processus séparés - Optimisé"""
     try:
-        # Chargement des modèles
-        load_models()
+        # Chargement des modèles seulement si nécessaire (évite rate limits)
+        if whisper_model is None or diarization_pipeline is None:
+            logger.info("🔄 Chargement modèles manquants...")
+            load_models()
         
         # Extraction des paramètres
         job_input = event.get("input", {})
@@ -514,8 +721,9 @@ def handler(event):
         min_speakers = job_input.get("min_speakers", 2)
         max_speakers = job_input.get("max_speakers", 3)
         
-        logger.info(f"🚀 Début traitement avec processus séparés: {audio_url}")
+        logger.info(f"🚀 Début traitement: {audio_url}")
         logger.info(f"👥 Paramètres: num={num_speakers}, min={min_speakers}, max={max_speakers}")
+        logger.info(f"🎮 Status modèles: Whisper={'✅' if whisper_model else '❌'} Pyannote={'✅' if diarization_pipeline else '❌'}")
         
         # Téléchargement
         audio_path, download_error = download_audio(audio_url)
@@ -538,7 +746,7 @@ def handler(event):
             formatted_transcript = create_formatted_transcript(result['segments'])
             
             # Retour optimisé
-            return {
+            response = {
                 "transcription": result['transcription'],
                 "transcription_formatee": formatted_transcript,
                 "segments": result['segments'],
@@ -546,31 +754,60 @@ def handler(event):
                 "language": result['language'],
                 "diarization_available": result['diarization_available'],
                 "device": str(device),
-                "model": "whisper-large-v2",
-                "pyannote_model": "speaker-diarization-3.1",
+                "model": "whisper-large-v2" if whisper_model else "whisper-unavailable",
+                "pyannote_model": "speaker-diarization-3.1" if diarization_pipeline else "unavailable",
                 "processing_method": "separated_processes",
-                "success": True,
-                # Infos de debug
-                "speakers_found_by_diarization": result.get('speakers_found_by_diarization', []),
-                "diarization_params_used": result.get('diarization_params_used', {}),
-                "warning": result.get('warning')
+                "success": True
             }
+            
+            # Infos de debug optionnelles
+            if 'speakers_found_by_diarization' in result:
+                response['speakers_found_by_diarization'] = result['speakers_found_by_diarization']
+            if 'diarization_params_used' in result:
+                response['diarization_params_used'] = result['diarization_params_used']
+            if 'warning' in result:
+                response['warning'] = result['warning']
+            
+            logger.info(f"✅ Traitement réussi: {len(result.get('segments', []))} segments, {result.get('speakers_detected', 0)} speakers")
+            return response
             
         finally:
             # Nettoyage
-            if os.path.exists(audio_path):
-                os.unlink(audio_path)
-                logger.info("🗑️ Fichier temporaire supprimé")
+            try:
+                if audio_path and os.path.exists(audio_path):
+                    os.unlink(audio_path)
+                    logger.info("🗑️ Fichier temporaire supprimé")
+            except Exception as cleanup_error:
+                logger.warning(f"⚠️ Erreur nettoyage: {cleanup_error}")
         
     except Exception as e:
         logger.error(f"❌ Erreur handler: {e}")
+        import traceback
+        logger.error(f"🔍 Traceback: {traceback.format_exc()}")
         return {"error": f"Erreur interne: {str(e)}"}
 
 if __name__ == "__main__":
-    # Pré-chargement des modèles
+    # Pré-chargement des modèles au démarrage pour éviter rate limits
     logger.info("🚀 Démarrage RunPod Serverless - Transcription + Diarisation SÉPARÉE")
-    load_models()
-    logger.info("✅ Modèles chargés - Prêt pour les requêtes")
+    logger.info("⏳ Chargement initial des modèles...")
+    
+    try:
+        load_models()
+        if whisper_model:
+            logger.info("✅ Whisper prêt")
+        else:
+            logger.error("❌ Whisper non chargé")
+            
+        if diarization_pipeline:
+            logger.info("✅ Pyannote prêt")
+        else:
+            logger.warning("⚠️ Pyannote non disponible - mode transcription seule")
+            
+        logger.info("✅ Modèles chargés - Prêt pour les requêtes")
+        
+    except Exception as startup_error:
+        logger.error(f"❌ Erreur chargement initial: {startup_error}")
+        logger.info("⚠️ Démarrage en mode dégradé - les modèles se chargeront à la première requête")
     
     # Démarrage du serveur RunPod
     runpod.serverless.start({"handler": handler})
