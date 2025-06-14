@@ -47,8 +47,12 @@ def load_models():
     
     if whisper_model is None:
         logger.info("🔄 Chargement Whisper large-v2...")
-        whisper_model = whisper.load_model("large-v2", device=device)
-        logger.info("✅ Whisper chargé")
+        try:
+            whisper_model = whisper.load_model("large-v2", device=device)
+            logger.info("✅ Whisper chargé avec succès")
+        except Exception as e:
+            logger.error(f"❌ Erreur chargement Whisper: {e}")
+            raise e
     
     if diarization_pipeline is None:
         logger.info("🔄 Chargement pyannote diarization...")
@@ -60,31 +64,49 @@ def load_models():
                 logger.error("❌ HUGGINGFACE_TOKEN manquant - diarization impossible")
                 return
             
-            model_name = "pyannote/speaker-diarization-3.1"
-            logger.info(f"📥 Chargement du modèle: {model_name}")
+            # Essayer plusieurs modèles en fallback
+            models_to_try = [
+                "pyannote/speaker-diarization-3.1",
+                "pyannote/speaker-diarization@2022.07",
+                "pyannote/speaker-diarization"
+            ]
             
-            diarization_pipeline = Pipeline.from_pretrained(
-                model_name,
-                use_auth_token=hf_token
-            )
-            
-            if torch.cuda.is_available():
-                logger.info("🚀 Déplacement du pipeline vers GPU...")
-                diarization_pipeline.to(device)
-                
+            for model_name in models_to_try:
                 try:
-                    pipeline_device = next(diarization_pipeline.parameters()).device
-                    logger.info(f"✅ Pipeline sur device: {pipeline_device}")
-                except:
-                    logger.warning("⚠️ Impossible de vérifier le device du pipeline")
-            
-            logger.info("✅ pyannote chargé et configuré")
+                    logger.info(f"📥 Tentative chargement: {model_name}")
+                    
+                    diarization_pipeline = Pipeline.from_pretrained(
+                        model_name,
+                        use_auth_token=hf_token,
+                        cache_dir="/tmp/huggingface_cache"  # Cache explicite
+                    )
+                    
+                    if torch.cuda.is_available():
+                        logger.info("🚀 Déplacement du pipeline vers GPU...")
+                        diarization_pipeline.to(device)
+                        
+                        try:
+                            pipeline_device = next(diarization_pipeline.parameters()).device
+                            logger.info(f"✅ Pipeline sur device: {pipeline_device}")
+                        except:
+                            logger.warning("⚠️ Impossible de vérifier le device du pipeline")
+                    
+                    logger.info(f"✅ pyannote chargé avec succès: {model_name}")
+                    break
+                    
+                except Exception as model_error:
+                    logger.warning(f"⚠️ Échec chargement {model_name}: {model_error}")
+                    if model_name == models_to_try[-1]:  # Dernier modèle
+                        raise model_error
+                    continue
             
         except Exception as e:
             logger.error(f"❌ Erreur chargement pyannote: {e}")
-            logger.info("💡 Vérifiez :")
-            logger.info("   - HUGGINGFACE_TOKEN est défini")
-            logger.info("   - Vous avez accepté les conditions: https://huggingface.co/pyannote/speaker-diarization-3.1")
+            logger.info("💡 Solutions possibles:")
+            logger.info("   - Vérifier HUGGINGFACE_TOKEN")
+            logger.info("   - Accepter les conditions: https://huggingface.co/pyannote/speaker-diarization-3.1")
+            logger.info("   - Vérifier la connexion internet")
+            logger.info("   - Redémarrer le container pour vider le cache")
             diarization_pipeline = None
 
 def format_timestamp(seconds):
@@ -92,46 +114,71 @@ def format_timestamp(seconds):
     return str(timedelta(seconds=int(seconds)))[2:]
 
 def download_audio(audio_url, max_size_mb=100):
-    """Télécharge un fichier audio depuis une URL"""
+    """Télécharge un fichier audio depuis une URL avec validation approfondie"""
     try:
         logger.info(f"📥 Téléchargement: {audio_url}")
         
-        # Vérification préliminaire
-        head_response = requests.head(audio_url, timeout=10)
-        if head_response.status_code != 200:
+        # Vérification préliminaire avec plus d'infos
+        try:
+            head_response = requests.head(audio_url, timeout=10, allow_redirects=True)
+            logger.info(f"🔍 Status HTTP: {head_response.status_code}")
+            logger.info(f"🔍 Headers: {dict(head_response.headers)}")
+        except Exception as head_error:
+            logger.warning(f"⚠️ HEAD request échoué: {head_error}, tentative GET direct")
+            head_response = None
+        
+        if head_response and head_response.status_code != 200:
             return None, f"URL non accessible: HTTP {head_response.status_code}"
         
-        content_length = head_response.headers.get('content-length')
-        if content_length:
-            size_mb = int(content_length) / (1024 * 1024)
-            if size_mb > max_size_mb:
-                return None, f"Fichier trop volumineux: {size_mb:.1f}MB > {max_size_mb}MB"
+        if head_response:
+            content_length = head_response.headers.get('content-length')
+            if content_length:
+                size_mb = int(content_length) / (1024 * 1024)
+                logger.info(f"📏 Taille annoncée: {size_mb:.2f}MB")
+                if size_mb > max_size_mb:
+                    return None, f"Fichier trop volumineux: {size_mb:.1f}MB > {max_size_mb}MB"
         
-        # Téléchargement
-        response = requests.get(audio_url, timeout=120, stream=True)
+        # Téléchargement avec validation
+        logger.info("⬇️ Début téléchargement...")
+        response = requests.get(audio_url, timeout=120, stream=True, allow_redirects=True)
         response.raise_for_status()
         
-        # Déterminer l'extension
+        # Déterminer l'extension avec plus de debug
         content_type = response.headers.get('content-type', '')
-        if 'audio/wav' in content_type:
+        logger.info(f"🎵 Content-Type: {content_type}")
+        
+        if 'audio/wav' in content_type or 'audio/x-wav' in content_type:
             ext = '.wav'
         elif 'audio/mpeg' in content_type or 'audio/mp3' in content_type:
             ext = '.mp3'
         elif 'audio/mp4' in content_type or 'audio/m4a' in content_type:
             ext = '.m4a'
+        elif 'audio/ogg' in content_type:
+            ext = '.ogg'
+        elif 'audio/flac' in content_type:
+            ext = '.flac'
         else:
             # Fallback basé sur l'URL
             parsed_url = urlparse(audio_url)
             path_ext = os.path.splitext(parsed_url.path)[1].lower()
-            ext = path_ext if path_ext in ['.wav', '.mp3', '.m4a', '.aac', '.flac'] else '.wav'
+            ext = path_ext if path_ext in ['.wav', '.mp3', '.m4a', '.aac', '.flac', '.ogg'] else '.wav'
+            logger.info(f"🔍 Extension fallback depuis URL: {ext}")
         
-        # Sauvegarder dans un fichier temporaire
+        # Sauvegarder dans un fichier temporaire avec validation
         with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp_file:
             downloaded_size = 0
+            chunk_count = 0
+            
             for chunk in response.iter_content(chunk_size=8192):
                 if chunk:
                     tmp_file.write(chunk)
                     downloaded_size += len(chunk)
+                    chunk_count += 1
+                    
+                    # Log progress pour gros fichiers
+                    if chunk_count % 1000 == 0:
+                        logger.info(f"📦 Téléchargé: {downloaded_size/1024/1024:.1f}MB...")
+                    
                     if downloaded_size > max_size_mb * 1024 * 1024:
                         tmp_file.close()
                         os.unlink(tmp_file.name)
@@ -139,11 +186,36 @@ def download_audio(audio_url, max_size_mb=100):
             
             temp_path = tmp_file.name
         
-        logger.info(f"✅ Téléchargé: {downloaded_size/1024/1024:.1f}MB -> {temp_path}")
+        # Validation du fichier téléchargé
+        final_size = os.path.getsize(temp_path)
+        logger.info(f"✅ Téléchargé: {final_size/1024/1024:.2f}MB -> {temp_path}")
+        
+        # Vérifications supplémentaires
+        if final_size < 44:  # En dessous de la taille d'un header WAV
+            os.unlink(temp_path)
+            return None, f"Fichier téléchargé trop petit: {final_size} bytes"
+        
+        # Tentative de validation basique du format audio
+        try:
+            with open(temp_path, 'rb') as f:
+                header = f.read(12)
+                logger.info(f"🔍 Header fichier: {header[:4]} / {header[8:12] if len(header) >= 12 else 'N/A'}")
+                
+                # Vérifications basiques
+                if ext == '.wav' and not header.startswith(b'RIFF'):
+                    logger.warning("⚠️ Fichier .wav sans header RIFF")
+                elif ext == '.mp3' and not (header.startswith(b'ID3') or header[0:2] == b'\xff\xfb'):
+                    logger.warning("⚠️ Fichier .mp3 suspect")
+                    
+        except Exception as validation_error:
+            logger.warning(f"⚠️ Validation header échouée: {validation_error}")
+        
         return temp_path, None
         
     except Exception as e:
         logger.error(f"❌ Erreur téléchargement: {e}")
+        import traceback
+        logger.error(f"🔍 Traceback: {traceback.format_exc()}")
         return None, str(e)
 
 def transcribe_with_whisper(audio_path):
@@ -151,43 +223,80 @@ def transcribe_with_whisper(audio_path):
     try:
         logger.info("🎯 ÉTAPE 1: Transcription Whisper large-v2...")
         
+        # Vérifier le fichier audio avant traitement
+        if not os.path.exists(audio_path):
+            return {'success': False, 'error': f'Fichier audio introuvable: {audio_path}'}
+        
+        file_size = os.path.getsize(audio_path)
+        logger.info(f"📁 Taille fichier: {file_size/1024/1024:.1f}MB")
+        
+        if file_size < 1024:  # Moins de 1KB
+            return {'success': False, 'error': f'Fichier audio trop petit: {file_size} bytes'}
+        
+        # Transcription avec paramètres plus permissifs pour debug
         result = whisper_model.transcribe(
             audio_path,
             language='fr',
             fp16=torch.cuda.is_available(),
             condition_on_previous_text=False,
-            no_speech_threshold=0.6,
-            logprob_threshold=-1.0,
+            no_speech_threshold=0.4,  # Plus permissif
+            logprob_threshold=-1.5,   # Plus permissif
             compression_ratio_threshold=2.4,
             temperature=0.0,
-            verbose=False,
-            word_timestamps=True  # Important pour une meilleure précision
+            verbose=True,  # Plus de debug
+            word_timestamps=False  # Désactiver pour debug
         )
         
-        logger.info(f"✅ Transcription terminée: {len(result['segments'])} segments")
+        logger.info(f"🔍 Résultat brut Whisper:")
+        logger.info(f"   - Texte complet: '{result.get('text', '')[:100]}...'")
+        logger.info(f"   - Langue détectée: {result.get('language', 'unknown')}")
+        logger.info(f"   - Nombre de segments: {len(result.get('segments', []))}")
         
-        # Nettoyage des segments
+        # Debug des segments
+        segments_raw = result.get("segments", [])
+        logger.info(f"✅ Transcription terminée: {len(segments_raw)} segments bruts")
+        
+        if len(segments_raw) == 0:
+            logger.warning("⚠️ Aucun segment trouvé - fichier potentiellement silencieux")
+            return {
+                'success': True,
+                'transcription': result.get("text", ""),
+                'segments': [],
+                'language': result.get("language", "fr"),
+                'warning': 'Aucun contenu audio détecté'
+            }
+        
+        # Nettoyage des segments avec plus de debug
         cleaned_segments = []
-        for segment in result["segments"]:
-            text = segment["text"].strip()
-            if text:  # Ignorer les segments vides
+        for i, segment in enumerate(segments_raw):
+            text = segment.get("text", "").strip()
+            no_speech_prob = segment.get("no_speech_prob", 0)
+            
+            logger.info(f"   Segment {i}: '{text}' (no_speech: {no_speech_prob:.2f})")
+            
+            if text:  # Garder même les segments avec peu de confiance pour debug
                 cleaned_segments.append({
                     "start": segment["start"],
                     "end": segment["end"],
                     "text": text,
-                    "confidence": 1 - segment.get("no_speech_prob", 0),
+                    "confidence": 1 - no_speech_prob,
+                    "no_speech_prob": no_speech_prob,
                     "words": segment.get("words", [])
                 })
         
+        logger.info(f"🧹 Segments nettoyés: {len(cleaned_segments)}")
+        
         return {
             'success': True,
-            'transcription': result["text"],
+            'transcription': result.get("text", ""),
             'segments': cleaned_segments,
             'language': result.get("language", "fr")
         }
         
     except Exception as e:
         logger.error(f"❌ Erreur transcription: {e}")
+        import traceback
+        logger.error(f"🔍 Traceback: {traceback.format_exc()}")
         return {
             'success': False,
             'error': str(e)
@@ -361,14 +470,30 @@ def smooth_speaker_transitions(segments, min_segment_duration=1.0, confidence_th
     return smoothed
 
 def transcribe_and_diarize_separated(audio_path, num_speakers=None, min_speakers=2, max_speakers=4):
-    """Fonction principale avec processus séparés"""
+    """Fonction principale avec processus séparés et fallbacks robustes"""
     try:
-        # ÉTAPE 1: Transcription
+        # ÉTAPE 1: Transcription (obligatoire)
+        logger.info("="*50)
         transcription_result = transcribe_with_whisper(audio_path)
         if not transcription_result['success']:
+            logger.error(f"❌ Transcription échouée: {transcription_result.get('error')}")
             return transcription_result
         
-        # ÉTAPE 2: Diarisation
+        # Vérifier qu'on a du contenu
+        if not transcription_result.get('segments'):
+            logger.warning("⚠️ Aucun segment transcrit - fichier probablement silencieux")
+            return {
+                'success': True,
+                'transcription': transcription_result.get('transcription', ''),
+                'segments': [],
+                'speakers_detected': 0,
+                'language': transcription_result.get('language', 'fr'),
+                'diarization_available': False,
+                'warning': 'Aucun contenu audio détecté'
+            }
+        
+        # ÉTAPE 2: Diarisation (optionnelle - continue si échoue)
+        logger.info("="*50)
         diarization_result = diarize_with_pyannote(
             audio_path,
             num_speakers=num_speakers,
@@ -377,35 +502,69 @@ def transcribe_and_diarize_separated(audio_path, num_speakers=None, min_speakers
         )
         
         if not diarization_result['success']:
-            # Retourner transcription seule si diarisation échoue
-            logger.warning("⚠️ Diarisation échouée - retour transcription seule")
-            segments_without_speakers = []
-            for segment in transcription_result["segments"]:
-                segments_without_speakers.append({
-                    "start": segment["start"],
-                    "end": segment["end"],
-                    "text": segment["text"],
-                    "speaker": "SPEAKER_00",
-                    "confidence": segment["confidence"]
-                })
+            # FALLBACK: Retourner transcription seule avec speakers génériques
+            logger.warning(f"⚠️ Diarisation échouée: {diarization_result.get('error')} - mode fallback")
+            
+            # Attribuer un speaker unique ou diviser artificiellement
+            segments_with_generic_speakers = []
+            
+            if num_speakers and num_speakers > 1:
+                # Diviser artificiellement en N speakers si demandé
+                total_duration = transcription_result["segments"][-1]["end"] if transcription_result["segments"] else 0
+                segment_per_speaker = len(transcription_result["segments"]) // num_speakers
+                
+                for i, segment in enumerate(transcription_result["segments"]):
+                    speaker_index = min(i // max(1, segment_per_speaker), num_speakers - 1)
+                    speaker_name = f"SPEAKER_{speaker_index:02d}"
+                    
+                    segments_with_generic_speakers.append({
+                        "start": segment["start"],
+                        "end": segment["end"],
+                        "text": segment["text"],
+                        "speaker": speaker_name,
+                        "confidence": segment["confidence"],
+                        "speaker_coverage": 0.0,  # Pas de vraie diarisation
+                        "artificial": True
+                    })
+                    
+                speakers_detected = num_speakers
+                
+            else:
+                # Un seul speaker générique
+                for segment in transcription_result["segments"]:
+                    segments_with_generic_speakers.append({
+                        "start": segment["start"],
+                        "end": segment["end"],
+                        "text": segment["text"],
+                        "speaker": "SPEAKER_00",
+                        "confidence": segment["confidence"],
+                        "speaker_coverage": 1.0,
+                        "artificial": True
+                    })
+                    
+                speakers_detected = 1
             
             return {
                 'success': True,
                 'transcription': transcription_result["transcription"],
-                'segments': segments_without_speakers,
-                'speakers_detected': 1,
+                'segments': segments_with_generic_speakers,
+                'speakers_detected': speakers_detected,
                 'language': transcription_result["language"],
                 'diarization_available': False,
-                'warning': f'Diarisation échouée: {diarization_result.get("error", "Erreur inconnue")}'
+                'warning': f'Diarisation échouée - speakers artificiels: {diarization_result.get("error", "Erreur inconnue")}',
+                'fallback_mode': True
             }
         
-        # ÉTAPE 3: Attribution des speakers
+        # ÉTAPE 3: Attribution des speakers (si diarisation réussie)
+        logger.info("="*50)
         final_segments = assign_speakers_to_transcription(
             transcription_result["segments"],
             diarization_result["speaker_segments"]
         )
         
         speakers_detected = len(set(seg["speaker"] for seg in final_segments if seg["speaker"] != "SPEAKER_UNKNOWN"))
+        
+        logger.info(f"🎉 Processus complet terminé avec succès!")
         
         return {
             'success': True,
@@ -415,14 +574,18 @@ def transcribe_and_diarize_separated(audio_path, num_speakers=None, min_speakers
             'language': transcription_result["language"],
             'diarization_available': True,
             'speakers_found_by_diarization': diarization_result["speakers_found"],
-            'diarization_params_used': diarization_result["diarization_params_used"]
+            'diarization_params_used': diarization_result["diarization_params_used"],
+            'fallback_mode': False
         }
         
     except Exception as e:
         logger.error(f"❌ Erreur processus séparé: {e}")
+        import traceback
+        logger.error(f"🔍 Traceback complet: {traceback.format_exc()}")
         return {
             'success': False,
-            'error': str(e)
+            'error': str(e),
+            'traceback': traceback.format_exc()
         }
 
 def create_formatted_transcript(segments):
@@ -497,12 +660,18 @@ def create_formatted_transcript(segments):
     return "\n".join(lines)
 
 def handler(event):
-    """Handler principal RunPod avec processus séparés"""
+    """Handler principal RunPod avec processus séparés et debug amélioré"""
     try:
-        # Chargement des modèles
-        load_models()
+        # Chargement des modèles avec gestion d'erreur
+        logger.info("🚀 Initialisation des modèles...")
+        try:
+            load_models()
+            logger.info("✅ Modèles initialisés")
+        except Exception as model_error:
+            logger.error(f"❌ Erreur chargement modèles: {model_error}")
+            return {"error": f"Erreur initialisation: {model_error}"}
         
-        # Extraction des paramètres
+        # Extraction des paramètres avec validation
         job_input = event.get("input", {})
         audio_url = job_input.get("audio_url")
         
@@ -513,12 +682,19 @@ def handler(event):
         min_speakers = job_input.get("min_speakers", 2)
         max_speakers = job_input.get("max_speakers", 4)
         
-        logger.info(f"🚀 Début traitement avec processus séparés: {audio_url}")
-        logger.info(f"👥 Paramètres: num={num_speakers}, min={min_speakers}, max={max_speakers}")
+        logger.info("="*60)
+        logger.info(f"🚀 DÉBUT TRAITEMENT AVEC PROCESSUS SÉPARÉS")
+        logger.info(f"🔗 URL: {audio_url}")
+        logger.info(f"👥 Paramètres speakers: num={num_speakers}, min={min_speakers}, max={max_speakers}")
+        logger.info(f"🎮 Device: {device}")
+        logger.info(f"🤖 Whisper disponible: {'✅' if whisper_model else '❌'}")
+        logger.info(f"🎭 Pyannote disponible: {'✅' if diarization_pipeline else '❌'}")
+        logger.info("="*60)
         
-        # Téléchargement
+        # Téléchargement avec validation approfondie
         audio_path, download_error = download_audio(audio_url)
         if download_error:
+            logger.error(f"❌ Échec téléchargement: {download_error}")
             return {"error": f"Erreur téléchargement: {download_error}"}
         
         try:
@@ -531,13 +707,17 @@ def handler(event):
             )
             
             if not result['success']:
-                return {"error": f"Erreur traitement: {result.get('error', 'Erreur inconnue')}"}
+                logger.error(f"❌ Échec traitement: {result.get('error')}")
+                error_response = {"error": f"Erreur traitement: {result.get('error', 'Erreur inconnue')}"}
+                if 'traceback' in result:
+                    error_response['debug_traceback'] = result['traceback']
+                return error_response
             
             # Création du transcript formaté
             formatted_transcript = create_formatted_transcript(result['segments'])
             
-            # Retour optimisé
-            return {
+            # Construction de la réponse avec informations de debug
+            response = {
                 "transcription": result['transcription'],
                 "transcription_formatee": formatted_transcript,
                 "segments": result['segments'],
@@ -546,24 +726,52 @@ def handler(event):
                 "diarization_available": result['diarization_available'],
                 "device": str(device),
                 "model": "whisper-large-v2",
-                "pyannote_model": "speaker-diarization-3.1",
+                "pyannote_model": "speaker-diarization-3.1" if diarization_pipeline else "unavailable",
                 "processing_method": "separated_processes",
                 "success": True,
-                # Infos de debug
-                "speakers_found_by_diarization": result.get('speakers_found_by_diarization', []),
-                "diarization_params_used": result.get('diarization_params_used', {}),
-                "warning": result.get('warning')
+                "fallback_mode": result.get('fallback_mode', False)
             }
             
+            # Ajouter infos de debug si disponibles
+            if 'speakers_found_by_diarization' in result:
+                response['speakers_found_by_diarization'] = result['speakers_found_by_diarization']
+            if 'diarization_params_used' in result:
+                response['diarization_params_used'] = result['diarization_params_used']
+            if 'warning' in result:
+                response['warning'] = result['warning']
+            
+            # Logs de succès
+            logger.info("="*60)
+            logger.info("🎉 TRAITEMENT TERMINÉ AVEC SUCCÈS!")
+            logger.info(f"📝 Transcription: {len(result.get('transcription', ''))} caractères")
+            logger.info(f"🗣️ Segments: {len(result.get('segments', []))}")
+            logger.info(f"👥 Speakers détectés: {result.get('speakers_detected', 0)}")
+            logger.info(f"🎭 Diarisation: {'✅' if result.get('diarization_available') else '❌'}")
+            logger.info(f"🔄 Mode fallback: {'✅' if result.get('fallback_mode') else '❌'}")
+            if result.get('warning'):
+                logger.info(f"⚠️ Avertissement: {result['warning']}")
+            logger.info("="*60)
+            
+            return response
+            
         finally:
-            # Nettoyage
-            if os.path.exists(audio_path):
-                os.unlink(audio_path)
-                logger.info("🗑️ Fichier temporaire supprimé")
+            # Nettoyage obligatoire
+            try:
+                if audio_path and os.path.exists(audio_path):
+                    os.unlink(audio_path)
+                    logger.info("🗑️ Fichier temporaire supprimé")
+            except Exception as cleanup_error:
+                logger.warning(f"⚠️ Erreur nettoyage: {cleanup_error}")
         
     except Exception as e:
-        logger.error(f"❌ Erreur handler: {e}")
-        return {"error": f"Erreur interne: {str(e)}"}
+        logger.error(f"❌ ERREUR CRITIQUE HANDLER: {e}")
+        import traceback
+        full_traceback = traceback.format_exc()
+        logger.error(f"🔍 Traceback complet: {full_traceback}")
+        return {
+            "error": f"Erreur interne critique: {str(e)}",
+            "debug_traceback": full_traceback
+        }
 
 if __name__ == "__main__":
     # Pré-chargement des modèles
