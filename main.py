@@ -1,5 +1,5 @@
 import runpod
-import whisper
+from faster_whisper import WhisperModel
 from pyannote.audio import Pipeline
 import os
 import tempfile
@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 # Configuration GPU
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+device_str = "cuda" if torch.cuda.is_available() else "cpu"
 logger.info(f"🎮 Device: {device}")
 
 # Optimisations GPU avancées
@@ -70,33 +71,42 @@ def cleanup_gpu_memory():
         logger.warning(f"⚠️ Erreur nettoyage GPU: {e}")
 
 def load_models():
-    """Chargement des modèles - Version simple et robuste"""
+    """Chargement des modèles - Version faster-whisper"""
     global whisper_model, diarization_pipeline
     
     # Diagnostic des versions au chargement
     try:
         import transformers
-        import whisper as whisper_lib
+        from faster_whisper import __version__ as fw_version
         logger.info(f"📦 Versions détectées:")
-        logger.info(f"   - Transformers: {transformers.__version__}")
-        logger.info(f"   - Whisper: {getattr(whisper_lib, '__version__', 'unknown')}")
         logger.info(f"   - PyTorch: {torch.__version__}")
+        logger.info(f"   - Transformers: {transformers.__version__}")
+        logger.info(f"   - Faster-Whisper: {fw_version}")
     except Exception as e:
         logger.warning(f"⚠️ Impossible de vérifier les versions: {e}")
     
     if whisper_model is None:
-        logger.info("🔄 Chargement Whisper large-v2...")
+        logger.info("🔄 Chargement Faster-Whisper large-v2...")
         try:
-            whisper_model = whisper.load_model("large-v2", device=device)
-            logger.info("✅ Whisper large-v2 chargé avec succès")
+            # faster-whisper avec support GPU optimisé
+            whisper_model = WhisperModel(
+                "large-v2", 
+                device=device_str,
+                compute_type="float16" if torch.cuda.is_available() else "float32"
+            )
+            logger.info("✅ Faster-Whisper large-v2 chargé avec succès")
         except Exception as e:
-            logger.error(f"❌ Erreur chargement Whisper large-v2: {e}")
+            logger.error(f"❌ Erreur chargement Faster-Whisper large-v2: {e}")
             try:
-                logger.info("🔄 Tentative Whisper base...")
-                whisper_model = whisper.load_model("base", device=device)
-                logger.info("✅ Whisper base chargé en fallback")
+                logger.info("🔄 Tentative Faster-Whisper base...")
+                whisper_model = WhisperModel(
+                    "base", 
+                    device=device_str,
+                    compute_type="float16" if torch.cuda.is_available() else "float32"
+                )
+                logger.info("✅ Faster-Whisper base chargé en fallback")
             except Exception as e2:
-                logger.error(f"❌ Échec total Whisper: {e2}")
+                logger.error(f"❌ Échec total Faster-Whisper: {e2}")
                 raise e2
     
     if diarization_pipeline is None:
@@ -271,7 +281,7 @@ def improved_segment_filtering(segments_raw):
         start_time = segment.get("start", 0)
         end_time = segment.get("end", 0)
         duration = end_time - start_time
-        no_speech_prob = segment.get("no_speech_prob", 0)
+        confidence = segment.get("avg_logprob", 0)  # faster-whisper utilise avg_logprob
         words = segment.get("words", [])
         
         # DÉTECTION HALLUCINATION CRITIQUE
@@ -299,8 +309,8 @@ def improved_segment_filtering(segments_raw):
         if not text or text.lower() in useless_texts or len(text) < 2:
             continue
             
-        # 3. Probabilité de silence trop élevée
-        if no_speech_prob > 0.85:
+        # 3. Confiance trop faible (faster-whisper utilise des valeurs négatives)
+        if confidence < -1.0:  # Seuil adapté pour faster-whisper
             continue
             
         # 4. Ratio mots/durée anormal
@@ -333,23 +343,24 @@ def improved_segment_filtering(segments_raw):
                 logger.debug(f"🔥 Segment fragmenté: '{safe_text_for_logging(text)}'")
                 continue
         
-        # SEGMENT VALIDE
+        # SEGMENT VALIDE - Adapter pour faster-whisper
         validated_words = []
         if words and isinstance(words, list):
             for word_info in words:
                 try:
-                    if isinstance(word_info, dict) and 'word' in word_info:
-                        word_start = max(word_info.get('start', start_time), start_time)
-                        word_end = min(word_info.get('end', end_time), end_time)
+                    # faster-whisper structure: word_info a des attributs au lieu de dict
+                    if hasattr(word_info, 'word') and hasattr(word_info, 'start'):
+                        word_start = max(float(word_info.start), start_time)
+                        word_end = min(float(word_info.end), end_time)
                         
                         if word_start >= word_end:
                             word_end = word_start + 0.1
                         
                         validated_words.append({
-                            'word': word_info['word'].strip(),
+                            'word': str(word_info.word).strip(),
                             'start': word_start,
                             'end': word_end,
-                            'probability': word_info.get('probability', 1.0)
+                            'probability': float(getattr(word_info, 'probability', 1.0))
                         })
                 except Exception:
                     continue
@@ -359,7 +370,7 @@ def improved_segment_filtering(segments_raw):
             "start": start_time,
             "end": end_time,
             "text": text,
-            "confidence": 1 - no_speech_prob,
+            "confidence": abs(confidence),  # Convertir en valeur positive
             "duration": duration,
             "words_count": words_count,
             "words": validated_words,
@@ -376,10 +387,10 @@ def improved_segment_filtering(segments_raw):
     
     return cleaned_segments, suspicious_texts, hallucination_detected
 
-def transcribe_with_whisper(audio_path):
-    """ÉTAPE 1: Transcription Whisper - Version corrigée pour dernières versions"""
+def transcribe_with_faster_whisper(audio_path):
+    """ÉTAPE 1: Transcription avec faster-whisper"""
     try:
-        logger.info("🎯 ÉTAPE 1: Transcription Whisper avec word_timestamps...")
+        logger.info("🎯 ÉTAPE 1: Transcription Faster-Whisper avec word_timestamps...")
         
         if not os.path.exists(audio_path):
             return {'success': False, 'error': f'Fichier audio introuvable: {audio_path}'}
@@ -390,71 +401,95 @@ def transcribe_with_whisper(audio_path):
         if file_size == 0:
             return {'success': False, 'error': 'Fichier audio vide'}
         
-        # NOUVELLE APPROCHE SIMPLE ET DIRECTE
-        result = None
-        transcription_method = "unknown"
-        
-        # Tentative 1: Version optimale avec word_timestamps
+        # TRANSCRIPTION FASTER-WHISPER
         try:
-            logger.info("🔄 Transcription avec word_timestamps (transformers 4.52.4)...")
+            logger.info("🔄 Transcription avec faster-whisper (word_timestamps natifs)...")
             
-            result = whisper_model.transcribe(
+            # faster-whisper API - plus simple et direct
+            segments_generator, info = whisper_model.transcribe(
                 audio_path,
                 language='fr',
                 word_timestamps=True,
                 condition_on_previous_text=False,
                 no_speech_threshold=0.6,
-                logprob_threshold=-1.0,
+                log_prob_threshold=-1.0,
                 compression_ratio_threshold=2.4,
-                temperature=0.0,
-                verbose=False
+                temperature=0.0
             )
             
-            transcription_method = "word_timestamps_modern"
-            logger.info("✅ Transcription réussie avec word_timestamps")
+            # Convertir le générateur en liste et extraire les infos
+            segments_list = list(segments_generator)
+            transcription_text = " ".join([seg.text for seg in segments_list])
+            
+            logger.info("✅ Transcription faster-whisper réussie avec word_timestamps")
+            transcription_method = "faster_whisper_with_words"
             
         except Exception as e:
-            logger.warning(f"⚠️ Erreur word_timestamps: {e}")
+            logger.warning(f"⚠️ Erreur faster-whisper avec word_timestamps: {e}")
             
-            # Tentative 2: Version basique sans word_timestamps
+            # Fallback sans word_timestamps
             try:
-                logger.info("🔄 Fallback sans word_timestamps...")
+                logger.info("🔄 Fallback faster-whisper sans word_timestamps...")
                 
-                result = whisper_model.transcribe(
+                segments_generator, info = whisper_model.transcribe(
                     audio_path,
                     language='fr',
+                    word_timestamps=False,
                     condition_on_previous_text=False,
                     no_speech_threshold=0.6,
-                    temperature=0.0,
-                    verbose=False
+                    temperature=0.0
                 )
                 
-                transcription_method = "standard_fallback"
-                logger.info("✅ Transcription réussie sans word_timestamps")
+                segments_list = list(segments_generator)
+                transcription_text = " ".join([seg.text for seg in segments_list])
+                
+                logger.info("✅ Transcription faster-whisper réussie sans word_timestamps")
+                transcription_method = "faster_whisper_segments_only"
                 
             except Exception as e2:
-                logger.error(f"❌ Échec total transcription: {e2}")
+                logger.error(f"❌ Échec total faster-whisper: {e2}")
                 return {'success': False, 'error': f'Transcription impossible: {e2}'}
         
-        if not result:
-            return {'success': False, 'error': 'Aucun résultat de transcription'}
+        if not segments_list:
+            return {'success': False, 'error': 'Aucun segment de transcription'}
         
         logger.info(f"📊 Transcription terminée:")
-        logger.info(f"   📝 Texte: '{result.get('text', '')[:100]}...'")
-        logger.info(f"   🌍 Langue: {result.get('language', 'unknown')}")
-        logger.info(f"   📈 Segments bruts: {len(result.get('segments', []))}")
+        logger.info(f"   📝 Texte: '{transcription_text[:100]}...'")
+        logger.info(f"   🌍 Langue: {info.language}")
+        logger.info(f"   📈 Segments bruts: {len(segments_list)}")
         logger.info(f"   🎯 Méthode: {transcription_method}")
         
         # Vérifier si on a des timestamps de mots
-        has_word_timestamps = transcription_method == "word_timestamps_modern"
+        has_word_timestamps = transcription_method == "faster_whisper_with_words"
         if has_word_timestamps:
-            logger.info("✅ Timestamps de mots disponibles")
+            logger.info("✅ Timestamps de mots disponibles (faster-whisper)")
         else:
             logger.info("⚠️ Pas de timestamps de mots - attribution niveau segment")
         
+        # Convertir les segments faster-whisper au format standard
+        converted_segments = []
+        for seg in segments_list:
+            # Convertir les mots faster-whisper
+            words_converted = []
+            if has_word_timestamps and hasattr(seg, 'words') and seg.words:
+                for word in seg.words:
+                    words_converted.append({
+                        'word': word.word,
+                        'start': word.start,
+                        'end': word.end,
+                        'probability': getattr(word, 'probability', 1.0)
+                    })
+            
+            converted_segments.append({
+                "start": seg.start,
+                "end": seg.end,
+                "text": seg.text.strip(),
+                "avg_logprob": seg.avg_logprob,
+                "words": words_converted
+            })
+        
         # Filtrage intelligent
-        segments_raw = result.get("segments", [])
-        cleaned_segments, suspicious_texts, hallucination_detected = improved_segment_filtering(segments_raw)
+        cleaned_segments, suspicious_texts, hallucination_detected = improved_segment_filtering(converted_segments)
         
         # Ajuster selon la méthode
         word_segments_count = 0
@@ -473,10 +508,10 @@ def transcribe_with_whisper(audio_path):
         
         return {
             'success': True,
-            'transcription': result.get("text", ""),
+            'transcription': transcription_text,
             'segments': cleaned_segments,
-            'language': result.get("language", "fr"),
-            'segments_raw_count': len(segments_raw),
+            'language': info.language,
+            'segments_raw_count': len(converted_segments),
             'segments_cleaned_count': len(cleaned_segments),
             'word_segments_count': word_segments_count,
             'repetition_warning': len(suspicious_texts) > 0 or hallucination_detected,
@@ -795,10 +830,10 @@ def validate_speakers(segments, known_speakers):
     return validated_segments
 
 def transcribe_and_diarize(audio_path, num_speakers=None, min_speakers=2, max_speakers=4):
-    """Fonction principale - Version simplifiée et robuste"""
+    """Fonction principale - Version faster-whisper"""
     try:
-        # ÉTAPE 1: Transcription
-        transcription_result = transcribe_with_whisper(audio_path)
+        # ÉTAPE 1: Transcription avec faster-whisper
+        transcription_result = transcribe_with_faster_whisper(audio_path)
         if not transcription_result['success']:
             return transcription_result
         
@@ -948,7 +983,7 @@ def create_formatted_transcript(segments):
             stats["percentage"] = (stats["total_time"] / total_duration * 100) if total_duration > 0 else 0
     
     # Créer le transcript
-    lines = ["=== TRANSCRIPTION AVEC DIARISATION - VERSION MODERNE ===\n"]
+    lines = ["=== TRANSCRIPTION AVEC DIARISATION - VERSION FASTER-WHISPER ===\n"]
     
     # Statistiques
     lines.append("📊 ANALYSE DES PARTICIPANTS:")
@@ -967,10 +1002,12 @@ def create_formatted_transcript(segments):
     lines.append(f"   ⏱️ Durée totale: {total_duration:.1f}s")
     lines.append(f"   🎯 Speakers identifiés: {len(speaker_stats)}")
     
-    # Métriques avancées
+    # Métriques faster-whisper
     word_level_count = sum(1 for seg in display_segments if seg.get("attribution_method") == "word_level")
     if word_level_count > 0:
         lines.append(f"   🔤 Attribution mot-par-mot: {word_level_count}/{len(display_segments)} segments")
+    
+    lines.append(f"   🚀 Engine: faster-whisper (optimisé)")
     
     lines.append("\n" + "="*60)
     lines.append("📝 CONVERSATION CHRONOLOGIQUE:")
@@ -1015,6 +1052,7 @@ def create_formatted_transcript(segments):
     
     lines.append(f"   🎯 Qualité transcription: {avg_confidence:.0f}%")
     lines.append(f"   🎭 Qualité diarisation: {avg_coverage:.0f}%")
+    lines.append(f"   🚀 Engine: faster-whisper (compatible transformers 4.52.4)")
     
     if word_level_count > 0:
         lines.append(f"   ✨ Attribution précise: {word_level_count}/{len(display_segments)} segments")
@@ -1022,7 +1060,7 @@ def create_formatted_transcript(segments):
     return "\n".join(lines)
 
 def handler(event):
-    """Handler principal RunPod - Version moderne et simplifiée"""
+    """Handler principal RunPod - Version faster-whisper"""
     try:
         # Chargement des modèles si nécessaire
         if whisper_model is None or diarization_pipeline is None:
@@ -1040,9 +1078,9 @@ def handler(event):
         min_speakers = job_input.get("min_speakers", 2)
         max_speakers = job_input.get("max_speakers", 3)
         
-        logger.info(f"🚀 Début traitement moderne: {audio_url}")
+        logger.info(f"🚀 Début traitement faster-whisper: {audio_url}")
         logger.info(f"👥 Paramètres: num={num_speakers}, min={min_speakers}, max={max_speakers}")
-        logger.info(f"🎮 Status modèles: Whisper={'✅' if whisper_model else '❌'} Pyannote={'✅' if diarization_pipeline else '❌'}")
+        logger.info(f"🎮 Status modèles: Faster-Whisper={'✅' if whisper_model else '❌'} Pyannote={'✅' if diarization_pipeline else '❌'}")
         
         # Téléchargement
         audio_path, download_error = download_audio(audio_url)
@@ -1050,7 +1088,7 @@ def handler(event):
             return {"error": f"Erreur téléchargement: {download_error}"}
         
         try:
-            # Transcription + Diarisation
+            # Transcription + Diarisation avec faster-whisper
             result = transcribe_and_diarize(
                 audio_path,
                 num_speakers=num_speakers,
@@ -1085,15 +1123,16 @@ def handler(event):
                 "language": result['language'],
                 "diarization_available": result['diarization_available'],
                 "device": str(device),
-                "model": "whisper-large-v2-modern",
+                "model": "faster-whisper-large-v2",
                 "pyannote_model": "speaker-diarization-3.1" if diarization_pipeline else "unavailable",
-                "processing_method": "modern_direct_approach",
+                "processing_method": "faster_whisper_optimized",
                 "enhancements": {
                     "word_level_timestamps": result.get('word_timestamps_available', False),
                     "word_level_speaker_attribution": result.get('word_timestamps_available', False),
                     "gpu_optimizations": torch.cuda.is_available(),
                     "intelligent_filtering": True,
-                    "hallucination_detection": True
+                    "hallucination_detection": True,
+                    "faster_whisper_engine": True
                 },
                 "success": True
             }
@@ -1117,7 +1156,7 @@ def handler(event):
                 response['word_timestamps_available'] = result['word_timestamps_available']
             
             # Logs de succès
-            logger.info(f"✅ Traitement réussi (version moderne):")
+            logger.info(f"✅ Traitement réussi (faster-whisper):")
             logger.info(f"   📝 Segments: {len(result.get('segments', []))}")
             logger.info(f"   🗣️ Speakers: {result.get('speakers_detected', 0)}")
             logger.info(f"   🎯 Speakers finaux: {result.get('final_speakers', 'unknown')}")
@@ -1145,32 +1184,33 @@ def handler(event):
         return {"error": f"Erreur interne: {str(e)}"}
 
 if __name__ == "__main__":
-    logger.info("🚀 Démarrage RunPod Serverless - Version MODERNE")
-    logger.info("✨ Fonctionnalités modernes:")
-    logger.info("   - Support total transformers 4.52.4")
+    logger.info("🚀 Démarrage RunPod Serverless - Version FASTER-WHISPER")
+    logger.info("✨ Fonctionnalités faster-whisper:")
+    logger.info("   - Compatible transformers 4.52.4+")
     logger.info("   - Word timestamps natifs")
+    logger.info("   - Performance optimisée")
     logger.info("   - Attribution niveau mot-par-mot")
     logger.info("   - Optimisations GPU avancées")
     logger.info("   - Élimination garantie SPEAKER_UNKNOWN")
     logger.info("   - Détection hallucinations Whisper")
     logger.info("   - Filtrage intelligent adaptatif")
-    logger.info("   - Code simplifié et robuste")
+    logger.info("   - Engine plus moderne et maintenu")
     
     logger.info("⏳ Chargement initial des modèles...")
     
     try:
         load_models()
         if whisper_model:
-            logger.info("✅ Whisper large-v2 prêt (version moderne)")
+            logger.info("✅ Faster-Whisper large-v2 prêt")
         else:
-            logger.error("❌ Whisper non chargé")
+            logger.error("❌ Faster-Whisper non chargé")
             
         if diarization_pipeline:
             logger.info("✅ Pyannote prêt")
         else:
             logger.warning("⚠️ Pyannote non disponible - mode transcription seule")
             
-        logger.info("✅ Service prêt avec support complet des dernières versions")
+        logger.info("✅ Service prêt avec faster-whisper + transformers 4.52.4")
         
     except Exception as startup_error:
         logger.error(f"❌ Erreur chargement initial: {startup_error}")
