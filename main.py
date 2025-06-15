@@ -291,9 +291,7 @@ def transcribe_with_whisper(audio_path):
                 compression_ratio_threshold=2.2,
                 temperature=0.0,
                 verbose=False,
-                word_timestamps=True,  # ✨ CLEF : Timestamps précis des mots
-                prepend_punctuations="\"'"¿([{-",
-                append_punctuations="\"'.。,，!！?？:：")]}、"
+                word_timestamps=True  # ✨ CLEF : Timestamps précis des mots
             )
             
         except Exception as whisper_error:
