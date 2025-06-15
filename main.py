@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 logger.info(f"🎮 Device: {device}")
 
-# Optimisations GPU avancées (style WhisperX)
+# Optimisations GPU avancées
 if torch.cuda.is_available():
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -33,102 +33,64 @@ if torch.cuda.is_available():
     gpu_name = torch.cuda.get_device_name()
     gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1e9
     logger.info(f"🎮 GPU: {gpu_name} ({gpu_memory:.1f}GB)")
-    logger.info(f"🚀 Optimisations WhisperX-style activées:")
-    logger.info(f"   - TF32 matmul: {torch.backends.cuda.matmul.allow_tf32}")
-    logger.info(f"   - TF32 cudnn: {torch.backends.cudnn.allow_tf32}")
-    logger.info(f"   - cuDNN benchmark: {torch.backends.cudnn.benchmark}")
+    logger.info(f"🚀 Optimisations GPU activées")
     
-    # GPU warmup optimisé
-    logger.info("🔥 Warmup GPU optimisé...")
+    # GPU warmup
+    logger.info("🔥 Warmup GPU...")
     x = torch.randn(2000, 2000, device=device, dtype=torch.float16 if torch.cuda.is_available() else torch.float32)
     y = torch.mm(x, x)
     torch.cuda.synchronize()
     del x, y
     torch.cuda.empty_cache()
-    logger.info("✅ GPU warmed up avec optimisations WhisperX")
+    logger.info("✅ GPU warmed up")
 else:
-    logger.info("💻 Mode CPU - optimisations GPU indisponibles")
+    logger.info("💻 Mode CPU")
 
 # Variables globales pour les modèles
 whisper_model = None
 diarization_pipeline = None
 
 def cleanup_gpu_memory():
-    """Nettoyage GPU agressif style WhisperX"""
+    """Nettoyage GPU"""
     try:
         import gc
         gc.collect()
         
         if torch.cuda.is_available():
-            # Nettoyage agressif
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
-            
-            # Forcer la libération de toutes les variables temporaires
-            for obj in gc.get_objects():
-                if torch.is_tensor(obj) and obj.is_cuda:
-                    del obj
-            
-            # Second passage de nettoyage
             gc.collect()
             torch.cuda.empty_cache()
             
-            # Stats mémoire pour monitoring
             allocated = torch.cuda.memory_allocated() / 1e9
             cached = torch.cuda.memory_reserved() / 1e9
-            logger.info(f"🧹 GPU Memory après nettoyage: {allocated:.1f}GB allocated, {cached:.1f}GB cached")
+            logger.info(f"🧹 GPU Memory: {allocated:.1f}GB allocated, {cached:.1f}GB cached")
             
     except Exception as e:
         logger.warning(f"⚠️ Erreur nettoyage GPU: {e}")
 
-def optimize_transcription_params(device, file_duration=None):
-    """Optimise les paramètres selon le hardware disponible"""
-    params = {
-        'fp16': torch.cuda.is_available(),
-        'condition_on_previous_text': False,
-        'no_speech_threshold': 0.6,
-        'logprob_threshold': -1.0,
-        'compression_ratio_threshold': 2.2,
-        'temperature': 0.0,
-        'word_timestamps': True
-    }
-    
-    # Optimisations spécifiques GPU
-    if torch.cuda.is_available():
-        gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1e9
-        
-        # Ajuster selon la mémoire GPU
-        if gpu_memory >= 24:  # A100/H100
-            params['batch_size'] = 32
-            logger.info("🎯 Paramètres optimisés pour GPU haute-mémoire (A100/H100)")
-        elif gpu_memory >= 16:  # V100/A10
-            params['batch_size'] = 24
-            logger.info("🎯 Paramètres optimisés pour GPU moyenne-mémoire (V100/A10)")
-        elif gpu_memory >= 8:  # RTX 4070/3080
-            params['batch_size'] = 16
-            logger.info("🎯 Paramètres optimisés pour GPU standard (RTX 4070/3080)")
-        else:  # T4 et inférieurs
-            params['batch_size'] = 8
-            params['fp16'] = True  # Forcer FP16 pour économiser mémoire
-            logger.info("🎯 Paramètres optimisés pour GPU faible-mémoire (T4)")
-    else:
-        params['batch_size'] = 4
-        params['fp16'] = False
-        logger.info("🎯 Paramètres optimisés pour CPU")
-    
-    return params
-
 def load_models():
-    """Chargement des modèles avec gestion du rate limiting"""
+    """Chargement des modèles - Version simple et robuste"""
     global whisper_model, diarization_pipeline
+    
+    # Diagnostic des versions au chargement
+    try:
+        import transformers
+        import whisper as whisper_lib
+        logger.info(f"📦 Versions détectées:")
+        logger.info(f"   - Transformers: {transformers.__version__}")
+        logger.info(f"   - Whisper: {getattr(whisper_lib, '__version__', 'unknown')}")
+        logger.info(f"   - PyTorch: {torch.__version__}")
+    except Exception as e:
+        logger.warning(f"⚠️ Impossible de vérifier les versions: {e}")
     
     if whisper_model is None:
         logger.info("🔄 Chargement Whisper large-v2...")
         try:
             whisper_model = whisper.load_model("large-v2", device=device)
-            logger.info("✅ Whisper chargé avec succès")
+            logger.info("✅ Whisper large-v2 chargé avec succès")
         except Exception as e:
-            logger.error(f"❌ Erreur chargement Whisper: {e}")
+            logger.error(f"❌ Erreur chargement Whisper large-v2: {e}")
             try:
                 logger.info("🔄 Tentative Whisper base...")
                 whisper_model = whisper.load_model("base", device=device)
@@ -147,7 +109,7 @@ def load_models():
                 logger.error("❌ HUGGINGFACE_TOKEN manquant - diarization impossible")
                 return
             
-            # GESTION RATE LIMITING
+            # Délai anti-rate-limit
             delay = random.uniform(2, 5)
             logger.info(f"⏱️ Délai anti-rate-limit: {delay:.1f}s")
             time.sleep(delay)
@@ -184,12 +146,6 @@ def load_models():
             if torch.cuda.is_available():
                 logger.info("🚀 Déplacement du pipeline vers GPU...")
                 diarization_pipeline.to(device)
-                
-                try:
-                    pipeline_device = next(diarization_pipeline.parameters()).device
-                    logger.info(f"✅ Pipeline sur device: {pipeline_device}")
-                except:
-                    logger.warning("⚠️ Impossible de vérifier le device du pipeline")
             
             logger.info("✅ pyannote chargé et configuré")
             
@@ -200,34 +156,24 @@ def load_models():
                 logger.info("   - Attendez quelques minutes avant de relancer")
                 logger.info("   - Redémarrez le container RunPod")
                 logger.info("   - Le service continuera en mode transcription seule")
-            else:
-                logger.info("💡 Vérifiez :")
-                logger.info("   - HUGGINGFACE_TOKEN est défini")
-                logger.info("   - Vous avez accepté les conditions")
             diarization_pipeline = None
+
+def format_timestamp(seconds):
+    """Convertit les secondes en format mm:ss"""
+    return str(timedelta(seconds=int(seconds)))[2:]
 
 def safe_text_for_logging(text, max_length=40):
     """Sécurise le texte pour l'affichage dans les logs"""
     if not text:
         return "VIDE"
     
-    # Nettoyer les caractères problématiques
     safe_text = str(text).replace('\n', ' ').replace('\r', ' ').replace('\t', ' ')
-    
-    # Supprimer les caractères de contrôle
     safe_text = ''.join(char for char in safe_text if ord(char) >= 32 or char in [' '])
     
-    # Tronquer si nécessaire
     if len(safe_text) > max_length:
         safe_text = safe_text[:max_length] + "..."
     
     return safe_text
-
-def format_timestamp(seconds):
-    """Convertit les secondes en format mm:ss"""
-    return str(timedelta(seconds=int(seconds)))[2:]
-    """Convertit les secondes en format mm:ss"""
-    return str(timedelta(seconds=int(seconds)))[2:]
 
 def download_audio(audio_url, max_size_mb=100):
     """Télécharge un fichier audio depuis une URL"""
@@ -284,10 +230,10 @@ def download_audio(audio_url, max_size_mb=100):
         return None, str(e)
 
 def improved_segment_filtering(segments_raw):
-    """Filtrage amélioré des segments - Version 2.0 avec détection d'hallucinations"""
+    """Filtrage intelligent des segments"""
     cleaned_segments = []
     
-    # Analyse globale pour seuils adaptatifs
+    # Analyse globale
     total_duration = sum(seg.get("end", 0) - seg.get("start", 0) for seg in segments_raw)
     text_frequency = {}
     
@@ -315,12 +261,9 @@ def improved_segment_filtering(segments_raw):
                        if count > max_repetitions}
     
     if suspicious_texts:
-        logger.warning(f"🚨 {len(suspicious_texts)} textes suspects détectés:")
-        for text, count in list(suspicious_texts.items())[:3]:  # Afficher les 3 premiers
-            logger.warning(f"   '{text[:40]}...' répété {count} fois")
+        logger.warning(f"🚨 {len(suspicious_texts)} textes suspects détectés")
     
-    # Tracking avancé des répétitions
-    consecutive_tracker = {}
+    # Détection hallucination
     hallucination_detected = False
     
     for i, segment in enumerate(segments_raw):
@@ -334,26 +277,24 @@ def improved_segment_filtering(segments_raw):
         # DÉTECTION HALLUCINATION CRITIQUE
         if i > len(segments_raw) * 0.7:  # Dans les 30% finaux
             if text in suspicious_texts and suspicious_texts[text] > 8:
-                # Compter répétitions récentes
                 recent_same = sum(1 for j in range(max(0, i-10), i) 
                                 if segments_raw[j].get("text", "").strip() == text)
                 if recent_same >= 5:
-                    logger.error(f"🚨 HALLUCINATION détectée à {i}/{len(segments_raw)}: '{text[:40]}...'")
+                    logger.error(f"🚨 HALLUCINATION détectée: '{safe_text_for_logging(text)}'")
                     hallucination_detected = True
-                    # Arrêter le traitement ici pour éviter la boucle infinie
                     break
         
-        # FILTRES RENFORCÉS
+        # FILTRES
         
-        # 1. Durée minimum adaptative
+        # 1. Durée minimum
         if duration < min_duration:
             continue
             
-        # 2. Texte vide ou inutile étendu
+        # 2. Texte vide ou inutile
         useless_texts = {
             ".", "...", "....", "-", "–", "euh", "heu", "mm", "hmm", 
             "ah", "oh", "ben", "donc", "alors", "voilà", "bon", "oui", "non",
-            " ", "", "merci", "au revoir", "bonjour"
+            " ", "", "merci", "au revoir", "bonjour", "bonsoir"
         }
         if not text or text.lower() in useless_texts or len(text) < 2:
             continue
@@ -362,70 +303,37 @@ def improved_segment_filtering(segments_raw):
         if no_speech_prob > 0.85:
             continue
             
-        # 4. Ratio mots/durée anormal (NOUVEAU seuil plus strict)
+        # 4. Ratio mots/durée anormal
         words_count = len(text.split())
         if duration > 0:
             words_per_second = words_count / duration
             if words_per_second > max_words_per_second or words_per_second < 0.2:
-                logger.info(f"🔥 Vitesse anormale: {words_per_second:.1f} mots/s - '{safe_text_for_logging(text)}'")
+                logger.debug(f"🔥 Vitesse anormale: {words_per_second:.1f} mots/s")
                 continue
         
-        # 5. NOUVEAU: Détection patterns répétitifs consécutifs
+        # 5. Détection patterns répétitifs
         if text in suspicious_texts:
-            # Analyser les 5 derniers segments
             recent_texts = [cleaned_segments[j]["text"] for j in range(max(0, len(cleaned_segments)-5), len(cleaned_segments))]
             same_count = recent_texts.count(text)
             
             if same_count >= 3:
-                logger.info(f"🔥 Pattern répétitif: '{safe_text_for_logging(text)}' ({same_count} dans les 5 derniers)")
-                continue
-                
-            # Pattern A-B-A-B détecté ?
-            if (len(recent_texts) >= 3 and 
-                recent_texts[-1] == recent_texts[-3] and
-                text == recent_texts[-1]):
-                logger.info(f"🔥 Pattern A-B-A-B: '{safe_text_for_logging(text)}'")
+                logger.debug(f"🔥 Pattern répétitif: '{safe_text_for_logging(text)}'")
                 continue
         
-        # 6. Validation timestamps renforcée
-        if start_time >= end_time or start_time < 0 or end_time > total_duration + 10:
-            logger.warning(f"⚠️ Timestamps invalides: {start_time:.2f} -> {end_time:.2f}")
+        # 6. Validation timestamps
+        if start_time >= end_time or start_time < 0:
             continue
             
-        # 7. Détection chevauchements anormaux
+        # 7. Chevauchements anormaux
         if cleaned_segments:
             last_seg = cleaned_segments[-1]
             gap = start_time - last_seg["end"]
-            overlap = min(end_time, last_seg["end"]) - max(start_time, last_seg["start"])
             
-            # Si chevauchement > 90% ET texte identique ou très similaire
-            if overlap > 0.9 * min(duration, last_seg["end"] - last_seg["start"]):
-                text_similarity = len(set(text.split()) & set(last_seg["text"].split())) / max(len(text.split()), 1)
-                if text_similarity > 0.8:
-                    logger.info(f"🔥 Doublon temporal/textuel: '{safe_text_for_logging(text)}'")
-                    continue
-            
-            # Gap anormalement petit entre segments différents
             if 0 < gap < 0.1 and text != last_seg["text"] and duration < 1.0:
-                logger.info(f"🔥 Segment fragmenté: '{safe_text_for_logging(text)}'")
+                logger.debug(f"🔥 Segment fragmenté: '{safe_text_for_logging(text)}'")
                 continue
         
-        # 8. NOUVEAU: Filtrage par cohérence sémantique
-        if len(cleaned_segments) >= 2:
-            # Vérifier si le segment fait sens dans le contexte
-            context_words = set()
-            for prev_seg in cleaned_segments[-2:]:
-                context_words.update(prev_seg["text"].lower().split())
-            
-            current_words = set(text.lower().split())
-            context_overlap = len(context_words & current_words) / max(len(current_words), 1)
-            
-            # Si aucun mot en commun avec le contexte ET segment très court
-            if context_overlap == 0 and duration < 1.5 and len(current_words) <= 2:
-                logger.info(f"🔥 Segment hors contexte: '{safe_text_for_logging(text)}'")
-                continue
-        
-        # SEGMENT VALIDE - Enrichissement des données
+        # SEGMENT VALIDE
         validated_words = []
         if words and isinstance(words, list):
             for word_info in words:
@@ -447,7 +355,7 @@ def improved_segment_filtering(segments_raw):
                     continue
         
         # Segment enrichi
-        enriched_segment = {
+        cleaned_segments.append({
             "start": start_time,
             "end": end_time,
             "text": text,
@@ -457,25 +365,21 @@ def improved_segment_filtering(segments_raw):
             "words": validated_words,
             "has_word_timestamps": len(validated_words) > 0,
             "words_per_second": words_count / duration if duration > 0 else 0,
-            "segment_quality": "high" if duration > 2 and no_speech_prob < 0.3 else "medium" if duration > 1 else "low",
-            "filter_version": "v2.0_enhanced"
-        }
-        
-        cleaned_segments.append(enriched_segment)
+        })
     
     removed_count = len(segments_raw) - len(cleaned_segments)
     
-    logger.info(f"✅ Filtrage v2.0 amélioré:")
+    logger.info(f"✅ Filtrage intelligent:")
     logger.info(f"   📝 Segments gardés: {len(cleaned_segments)} / {len(segments_raw)} ({removed_count} supprimés)")
-    logger.info(f"   🚨 Hallucination détectée: {'⚠️ OUI' if hallucination_detected else '✅ Non'}")
+    logger.info(f"   🚨 Hallucination: {'⚠️ OUI' if hallucination_detected else '✅ Non'}")
     logger.info(f"   🔤 Segments avec mots: {sum(1 for s in cleaned_segments if s['has_word_timestamps'])}")
     
     return cleaned_segments, suspicious_texts, hallucination_detected
 
 def transcribe_with_whisper(audio_path):
-    """ÉTAPE 1: Transcription avec filtrage amélioré - Gestion erreurs version"""
+    """ÉTAPE 1: Transcription Whisper - Version corrigée pour dernières versions"""
     try:
-        logger.info("🎯 ÉTAPE 1: Transcription Whisper large-v2 (mode amélioré v2.0)...")
+        logger.info("🎯 ÉTAPE 1: Transcription Whisper avec word_timestamps...")
         
         if not os.path.exists(audio_path):
             return {'success': False, 'error': f'Fichier audio introuvable: {audio_path}'}
@@ -486,126 +390,86 @@ def transcribe_with_whisper(audio_path):
         if file_size == 0:
             return {'success': False, 'error': 'Fichier audio vide'}
         
-        # STRATÉGIE DE TRANSCRIPTION PROGRESSIVE
-        transcription_attempts = [
-            {
-                "name": "word_timestamps_full",
-                "params": {
-                    "language": 'fr',
-                    "fp16": torch.cuda.is_available(),
-                    "condition_on_previous_text": False,
-                    "no_speech_threshold": 0.6,
-                    "logprob_threshold": -1.0,
-                    "compression_ratio_threshold": 2.0,
-                    "temperature": 0.0,
-                    "verbose": False,
-                    "word_timestamps": True,
-                    "suppress_tokens": [],
-                    "initial_prompt": None
-                }
-            },
-            {
-                "name": "word_timestamps_basic",
-                "params": {
-                    "language": 'fr',
-                    "condition_on_previous_text": False,
-                    "no_speech_threshold": 0.6,
-                    "temperature": 0.0,
-                    "verbose": False,
-                    "word_timestamps": True
-                }
-            },
-            {
-                "name": "standard_optimized",
-                "params": {
-                    "language": 'fr',
-                    "fp16": torch.cuda.is_available(),
-                    "condition_on_previous_text": False,
-                    "no_speech_threshold": 0.6,
-                    "logprob_threshold": -1.0,
-                    "compression_ratio_threshold": 2.0,
-                    "temperature": 0.0,
-                    "verbose": False
-                }
-            },
-            {
-                "name": "minimal_safe",
-                "params": {
-                    "language": 'fr',
-                    "condition_on_previous_text": False,
-                    "temperature": 0.0,
-                    "verbose": False
-                }
-            }
-        ]
-        
+        # NOUVELLE APPROCHE SIMPLE ET DIRECTE
         result = None
-        successful_method = None
+        transcription_method = "unknown"
         
-        for attempt in transcription_attempts:
+        # Tentative 1: Version optimale avec word_timestamps
+        try:
+            logger.info("🔄 Transcription avec word_timestamps (transformers 4.52.4)...")
+            
+            result = whisper_model.transcribe(
+                audio_path,
+                language='fr',
+                word_timestamps=True,
+                condition_on_previous_text=False,
+                no_speech_threshold=0.6,
+                logprob_threshold=-1.0,
+                compression_ratio_threshold=2.4,
+                temperature=0.0,
+                verbose=False
+            )
+            
+            transcription_method = "word_timestamps_modern"
+            logger.info("✅ Transcription réussie avec word_timestamps")
+            
+        except Exception as e:
+            logger.warning(f"⚠️ Erreur word_timestamps: {e}")
+            
+            # Tentative 2: Version basique sans word_timestamps
             try:
-                logger.info(f"🔄 Tentative transcription: {attempt['name']}")
-                result = whisper_model.transcribe(audio_path, **attempt['params'])
-                successful_method = attempt['name']
-                logger.info(f"✅ Transcription réussie avec: {successful_method}")
-                break
+                logger.info("🔄 Fallback sans word_timestamps...")
                 
-            except Exception as whisper_error:
-                error_str = str(whisper_error)
+                result = whisper_model.transcribe(
+                    audio_path,
+                    language='fr',
+                    condition_on_previous_text=False,
+                    no_speech_threshold=0.6,
+                    temperature=0.0,
+                    verbose=False
+                )
                 
-                # Gestion d'erreurs spécifiques
-                if "Cannot set attribute 'src'" in error_str:
-                    logger.warning(f"⚠️ Erreur version Whisper/Transformers: {attempt['name']}")
-                    logger.info("💡 Cette erreur est due à une incompatibilité de versions")
-                elif "word_timestamps" in error_str:
-                    logger.warning(f"⚠️ word_timestamps non supporté: {attempt['name']}")
-                elif "fp16" in error_str:
-                    logger.warning(f"⚠️ FP16 non supporté: {attempt['name']}")
-                else:
-                    logger.warning(f"⚠️ Erreur inconnue avec {attempt['name']}: {error_str}")
+                transcription_method = "standard_fallback"
+                logger.info("✅ Transcription réussie sans word_timestamps")
                 
-                # Continuer avec la tentative suivante
-                continue
+            except Exception as e2:
+                logger.error(f"❌ Échec total transcription: {e2}")
+                return {'success': False, 'error': f'Transcription impossible: {e2}'}
         
-        # Si aucune méthode n'a fonctionné
-        if result is None:
-            logger.error("❌ ÉCHEC: Toutes les méthodes de transcription ont échoué")
-            return {
-                'success': False, 
-                'error': 'Transcription impossible avec toutes les méthodes disponibles. Vérifiez la compatibilité Whisper/Transformers.'
-            }
+        if not result:
+            return {'success': False, 'error': 'Aucun résultat de transcription'}
         
-        logger.info(f"📊 Transcription brute terminée avec {successful_method}:")
+        logger.info(f"📊 Transcription terminée:")
         logger.info(f"   📝 Texte: '{result.get('text', '')[:100]}...'")
         logger.info(f"   🌍 Langue: {result.get('language', 'unknown')}")
         logger.info(f"   📈 Segments bruts: {len(result.get('segments', []))}")
+        logger.info(f"   🎯 Méthode: {transcription_method}")
         
-        # Vérifier si on a des timestamps de mots selon la méthode utilisée
-        has_word_timestamps = successful_method in ["word_timestamps_full", "word_timestamps_basic"]
+        # Vérifier si on a des timestamps de mots
+        has_word_timestamps = transcription_method == "word_timestamps_modern"
         if has_word_timestamps:
             logger.info("✅ Timestamps de mots disponibles")
         else:
-            logger.info("⚠️ Pas de timestamps de mots - attribution niveau segment uniquement")
+            logger.info("⚠️ Pas de timestamps de mots - attribution niveau segment")
         
-        # NOUVEAU: Filtrage amélioré avec détection hallucinations
+        # Filtrage intelligent
         segments_raw = result.get("segments", [])
         cleaned_segments, suspicious_texts, hallucination_detected = improved_segment_filtering(segments_raw)
         
-        # Ajuster les informations de mots selon la méthode de transcription
+        # Ajuster selon la méthode
         word_segments_count = 0
         if has_word_timestamps:
             word_segments_count = sum(1 for seg in cleaned_segments if seg.get("has_word_timestamps"))
         else:
-            # Pour les méthodes sans word_timestamps, marquer explicitement
+            # Marquer explicitement l'absence de timestamps de mots
             for seg in cleaned_segments:
                 seg["has_word_timestamps"] = False
-                seg["words"] = []  # Pas de mots détaillés
+                seg["words"] = []
         
-        logger.info(f"✅ Transcription terminée avec améliorations:")
-        logger.info(f"   📝 Segments finaux: {len(cleaned_segments)} (supprimé {len(segments_raw) - len(cleaned_segments)})")
-        logger.info(f"   🔤 Segments avec mots: {word_segments_count}/{len(cleaned_segments)}")
-        logger.info(f"   🚨 Hallucinations: {'⚠️ DÉTECTÉES' if hallucination_detected else '✅ Aucune'}")
-        logger.info(f"   🎯 Méthode utilisée: {successful_method}")
+        logger.info(f"✅ Transcription terminée:")
+        logger.info(f"   📝 Segments finaux: {len(cleaned_segments)}")
+        logger.info(f"   🔤 Segments avec mots: {word_segments_count}")
+        logger.info(f"   🚨 Hallucinations: {'⚠️' if hallucination_detected else '✅'}")
         
         return {
             'success': True,
@@ -618,39 +482,8 @@ def transcribe_with_whisper(audio_path):
             'repetition_warning': len(suspicious_texts) > 0 or hallucination_detected,
             'suspicious_repetitions': suspicious_texts,
             'hallucination_detected': hallucination_detected,
-            'filter_version': "v2.0_enhanced",
-            'transcription_method': successful_method,
+            'transcription_method': transcription_method,
             'word_timestamps_available': has_word_timestamps
-        }
-        
-        logger.info(f"📊 Transcription brute terminée:")
-        logger.info(f"   📝 Texte: '{result.get('text', '')[:100]}...'")
-        logger.info(f"   🌍 Langue: {result.get('language', 'unknown')}")
-        logger.info(f"   📈 Segments bruts: {len(result.get('segments', []))}")
-        
-        # NOUVEAU: Filtrage amélioré avec détection hallucinations
-        segments_raw = result.get("segments", [])
-        cleaned_segments, suspicious_texts, hallucination_detected = improved_segment_filtering(segments_raw)
-        
-        word_segments_count = sum(1 for seg in cleaned_segments if seg.get("has_word_timestamps"))
-        
-        logger.info(f"✅ Transcription terminée avec améliorations:")
-        logger.info(f"   📝 Segments finaux: {len(cleaned_segments)} (supprimé {len(segments_raw) - len(cleaned_segments)})")
-        logger.info(f"   🔤 Segments avec mots: {word_segments_count}/{len(cleaned_segments)}")
-        logger.info(f"   🚨 Hallucinations: {'⚠️ DÉTECTÉES' if hallucination_detected else '✅ Aucune'}")
-        
-        return {
-            'success': True,
-            'transcription': result.get("text", ""),
-            'segments': cleaned_segments,
-            'language': result.get("language", "fr"),
-            'segments_raw_count': len(segments_raw),
-            'segments_cleaned_count': len(cleaned_segments),
-            'word_segments_count': word_segments_count,
-            'repetition_warning': len(suspicious_texts) > 0 or hallucination_detected,
-            'suspicious_repetitions': suspicious_texts,
-            'hallucination_detected': hallucination_detected,
-            'filter_version': "v2.0_enhanced"
         }
         
     except Exception as e:
@@ -714,106 +547,9 @@ def diarize_with_pyannote(audio_path, num_speakers=None, min_speakers=2, max_spe
         logger.error(f"❌ Erreur diarisation: {e}")
         return {'success': False, 'error': str(e)}
 
-def enhanced_speaker_validation(segments):
-    """Validation finale renforcée des speakers"""
-    logger.info("🔒 Validation finale renforcée des speakers...")
-    
-    validated_segments = []
-    speaker_consistency_score = {}
-    
-    # Analyser la cohérence de chaque speaker
-    valid_speakers = set()
-    for segment in segments:
-        speaker = segment["speaker"]
-        if speaker != "SPEAKER_UNKNOWN":
-            valid_speakers.add(speaker)
-    
-    if not valid_speakers:
-        valid_speakers = {"SPEAKER_00", "SPEAKER_01"}
-        logger.warning("⚠️ Aucun speaker valide - création forcée")
-    
-    # Calculer scores de cohérence
-    for speaker in valid_speakers:
-        speaker_segments = [seg for seg in segments if seg["speaker"] == speaker]
-        
-        if speaker_segments:
-            total_coverage = sum(seg.get("speaker_coverage", 0) for seg in speaker_segments)
-            avg_coverage = total_coverage / len(speaker_segments)
-            
-            speaker_consistency_score[speaker] = {
-                "avg_coverage": avg_coverage,
-                "segments_count": len(speaker_segments),
-                "total_time": sum(seg["end"] - seg["start"] for seg in speaker_segments)
-            }
-    
-    logger.info(f"📊 Scores de cohérence speakers:")
-    for speaker, score in speaker_consistency_score.items():
-        logger.info(f"   {speaker}: {score['avg_coverage']:.2f} coverage, {score['segments_count']} segments")
-    
-    # Validation et correction
-    for i, segment in enumerate(segments):
-        current_speaker = segment["speaker"]
-        
-        # Éliminer définitivement SPEAKER_UNKNOWN
-        if current_speaker == "SPEAKER_UNKNOWN":
-            # Trouver le meilleur speaker de remplacement
-            if speaker_consistency_score:
-                best_replacement = max(speaker_consistency_score.items(), 
-                                     key=lambda x: x[1]["avg_coverage"])[0]
-            else:
-                best_replacement = list(valid_speakers)[0]
-            
-            logger.warning(f"🔧 CORRECTION: SPEAKER_UNKNOWN → {best_replacement}")
-            segment["speaker"] = best_replacement
-            segment["speaker_coverage"] = 0.1
-            segment["final_correction"] = True
-        
-        # Corriger speakers avec coverage très faible
-        elif segment.get("speaker_coverage", 0) < 0.15:
-            # Analyser le contexte
-            context_speakers = []
-            
-            # Contexte précédent (2 segments)
-            for j in range(max(0, i-2), i):
-                if j < len(segments):
-                    context_speakers.append(segments[j]["speaker"])
-            
-            # Contexte suivant (2 segments)
-            for j in range(i+1, min(len(segments), i+3)):
-                context_speakers.append(segments[j]["speaker"])
-            
-            # Speaker le plus fréquent dans le contexte
-            if context_speakers:
-                most_common = Counter(context_speakers).most_common(1)[0][0]
-                
-                if most_common != current_speaker and most_common in valid_speakers:
-                    logger.info(f"🔧 Correction contexte: {current_speaker} → {most_common}")
-                    segment["speaker"] = most_common
-                    segment["speaker_coverage"] = 0.3
-                    segment["context_correction"] = True
-        
-        validated_segments.append(segment)
-    
-    # Vérification finale
-    final_speakers = set(seg["speaker"] for seg in validated_segments)
-    unknown_count = sum(1 for seg in validated_segments if seg["speaker"] == "SPEAKER_UNKNOWN")
-    
-    if unknown_count > 0:
-        logger.error(f"❌ ÉCHEC: {unknown_count} SPEAKER_UNKNOWN encore présents!")
-        # Correction d'urgence finale
-        fallback_speaker = list(valid_speakers)[0] if valid_speakers else "SPEAKER_00"
-        for seg in validated_segments:
-            if seg["speaker"] == "SPEAKER_UNKNOWN":
-                seg["speaker"] = fallback_speaker
-                seg["emergency_final_fix"] = True
-    else:
-        logger.info(f"✅ Validation finale réussie: {sorted(final_speakers)}")
-    
-    return validated_segments
-
-def assign_speakers_to_transcription_enhanced(transcription_segments, speaker_segments):
-    """ÉTAPE 3: Attribution WhisperX-style avec précision mot-par-mot"""
-    logger.info("🔗 ÉTAPE 3: Attribution speakers niveau mot (style WhisperX amélioré)...")
+def assign_speakers_to_transcription(transcription_segments, speaker_segments):
+    """ÉTAPE 3: Attribution speakers intelligente"""
+    logger.info("🔗 ÉTAPE 3: Attribution speakers...")
     
     final_segments = []
     
@@ -833,7 +569,7 @@ def assign_speakers_to_transcription_enhanced(transcription_segments, speaker_se
         words = trans_seg.get("words", [])
         has_word_timestamps = trans_seg.get("has_word_timestamps", False)
         
-        # Attribution niveau mot (comme WhisperX)
+        # Attribution niveau mot si timestamps disponibles
         if has_word_timestamps and words:
             logger.debug(f"🔤 Attribution précise pour segment avec {len(words)} mots")
             
@@ -850,7 +586,7 @@ def assign_speakers_to_transcription_enhanced(transcription_segments, speaker_se
                 best_speaker = None
                 best_coverage = 0
                 
-                # Méthode 1: Centre du mot dans un segment de speaker
+                # Centre du mot dans un segment de speaker
                 for spk_seg in speaker_segments:
                     spk_start = spk_seg["start"]
                     spk_end = spk_seg["end"]
@@ -865,7 +601,7 @@ def assign_speakers_to_transcription_enhanced(transcription_segments, speaker_se
                             best_coverage = coverage
                             best_speaker = spk_seg["speaker"]
                 
-                # Méthode 2: Meilleur recouvrement si centre pas trouvé
+                # Fallback par recouvrement
                 if not best_speaker:
                     for spk_seg in speaker_segments:
                         spk_start = spk_seg["start"]
@@ -880,17 +616,7 @@ def assign_speakers_to_transcription_enhanced(transcription_segments, speaker_se
                             best_coverage = coverage
                             best_speaker = spk_seg["speaker"]
                 
-                # Fallback temporel
-                if not best_speaker:
-                    min_distance = float('inf')
-                    for spk_seg in speaker_segments:
-                        spk_center = (spk_seg["start"] + spk_seg["end"]) / 2
-                        distance = abs(word_center - spk_center)
-                        if distance < min_distance:
-                            min_distance = distance
-                            best_speaker = spk_seg["speaker"]
-                
-                # Dernier recours
+                # Fallback final
                 if not best_speaker or best_speaker not in known_speakers:
                     best_speaker = known_speakers[0]
                     best_coverage = 0.1
@@ -910,14 +636,14 @@ def assign_speakers_to_transcription_enhanced(transcription_segments, speaker_se
                     segment_speaker_votes[best_speaker] = 0
                 segment_speaker_votes[best_speaker] += best_coverage * word_duration
             
-            # Déterminer le speaker principal du segment par vote pondéré
+            # Déterminer le speaker principal du segment
             if segment_speaker_votes:
                 segment_speaker = max(segment_speaker_votes.items(), key=lambda x: x[1])[0]
                 segment_coverage = segment_speaker_votes[segment_speaker] / trans_duration
             else:
                 segment_speaker = known_speakers[0]
                 segment_coverage = 0.1
-            
+                
         else:
             # Attribution classique niveau segment
             best_speaker = None
@@ -960,7 +686,7 @@ def assign_speakers_to_transcription_enhanced(transcription_segments, speaker_se
             
             segment_speaker = best_speaker
             segment_coverage = best_coverage
-            words_with_speakers = words  # Garder mots originaux sans speakers
+            words_with_speakers = words
         
         # Créer le segment final
         final_segments.append({
@@ -975,9 +701,9 @@ def assign_speakers_to_transcription_enhanced(transcription_segments, speaker_se
             "has_word_speakers": has_word_timestamps and len(words_with_speakers) > 0
         })
     
-    # Post-traitement amélioré
-    final_segments = smooth_speaker_transitions_enhanced(final_segments)
-    final_segments = enhanced_speaker_validation(final_segments)
+    # Post-traitement: lissage et validation
+    final_segments = smooth_speaker_transitions(final_segments)
+    final_segments = validate_speakers(final_segments, known_speakers)
     
     word_level_count = sum(1 for seg in final_segments if seg.get("attribution_method") == "word_level")
     speakers_assigned = len(set(seg["speaker"] for seg in final_segments))
@@ -988,8 +714,8 @@ def assign_speakers_to_transcription_enhanced(transcription_segments, speaker_se
     
     return final_segments
 
-def smooth_speaker_transitions_enhanced(segments, min_segment_duration=1.0, confidence_threshold=0.3):
-    """Lissage amélioré avec prise en compte des mots"""
+def smooth_speaker_transitions(segments, min_segment_duration=1.0):
+    """Lissage des transitions de speakers"""
     if len(segments) < 3:
         return segments
     
@@ -1006,85 +732,75 @@ def smooth_speaker_transitions_enhanced(segments, min_segment_duration=1.0, conf
         prev_speaker = prev_seg["speaker"]
         next_speaker = next_seg["speaker"]
         
-        should_smooth = False
-        new_speaker = None
-        smooth_reason = ""
-        
-        # Cas 1: Segment court entre même speaker
+        # Cas: segment court entre même speaker
         if (current_duration < min_segment_duration and
             prev_speaker == next_speaker and
             current_speaker != prev_speaker and
-            current.get("speaker_coverage", 0) < confidence_threshold):
+            current.get("speaker_coverage", 0) < 0.3):
             
-            should_smooth = True
-            new_speaker = prev_speaker
-            smooth_reason = "segment_court_entre_meme_speaker"
-        
-        # Cas 2: Attribution avec très faible confiance
-        elif (current.get("speaker_coverage", 0) < 0.2 and
-              prev_speaker == next_speaker and
-              prev_speaker != current_speaker):
-            
-            should_smooth = True
-            new_speaker = prev_speaker
-            smooth_reason = "faible_confiance_entre_meme_speaker"
-        
-        # Cas 3: Segments avec mots - vérifier cohérence
-        elif (current.get("has_word_speakers") and current.get("words")):
-            # Compter les mots par speaker
-            word_speakers = {}
-            for word in current["words"]:
-                if isinstance(word, dict) and "speaker" in word:
-                    spk = word["speaker"]
-                    word_speakers[spk] = word_speakers.get(spk, 0) + 1
-            
-            # Si majorité des mots vote pour un autre speaker
-            if word_speakers:
-                word_majority_speaker = max(word_speakers.items(), key=lambda x: x[1])[0]
-                majority_ratio = word_speakers[word_majority_speaker] / len(current["words"])
-                
-                if (word_majority_speaker != current_speaker and majority_ratio > 0.7):
-                    should_smooth = True
-                    new_speaker = word_majority_speaker
-                    smooth_reason = "majorite_mots_autre_speaker"
-        
-        # Appliquer le lissage
-        if should_smooth and new_speaker:
-            logger.debug(f"🔧 Lissage ({smooth_reason}): '{current['text'][:30]}...' {current_speaker} → {new_speaker}")
-            smoothed[i]["speaker"] = new_speaker
+            logger.debug(f"🔧 Lissage: '{current['text'][:30]}...' {current_speaker} → {prev_speaker}")
+            smoothed[i]["speaker"] = prev_speaker
             smoothed[i]["smoothed"] = True
-            smoothed[i]["smooth_reason"] = smooth_reason
-            
-            # Mettre à jour les speakers des mots si applicable
-            if smoothed[i].get("has_word_speakers") and smoothed[i].get("words"):
-                for word in smoothed[i]["words"]:
-                    if isinstance(word, dict) and "speaker" in word:
-                        word["speaker"] = new_speaker
-                        word["smoothed"] = True
-            
             changes_made += 1
     
     if changes_made > 0:
-        logger.info(f"✅ Lissage amélioré: {changes_made} corrections appliquées")
+        logger.info(f"✅ Lissage: {changes_made} corrections appliquées")
     
     return smoothed
 
-def transcribe_and_diarize_separated(audio_path, num_speakers=None, min_speakers=2, max_speakers=4):
-    """Fonction principale avec processus séparés - Version améliorée v2.0"""
+def validate_speakers(segments, known_speakers):
+    """Validation finale des speakers - Éliminer SPEAKER_UNKNOWN"""
+    validated_segments = []
+    unknown_count = 0
+    
+    for i, segment in enumerate(segments):
+        current_speaker = segment["speaker"]
+        
+        # Éliminer SPEAKER_UNKNOWN
+        if current_speaker == "SPEAKER_UNKNOWN" or current_speaker not in known_speakers:
+            unknown_count += 1
+            
+            # Stratégie: hériter du précédent ou suivant
+            if i > 0 and validated_segments[-1]["speaker"] in known_speakers:
+                new_speaker = validated_segments[-1]["speaker"]
+                method = "inherit_previous"
+            elif i < len(segments) - 1 and segments[i+1]["speaker"] in known_speakers:
+                new_speaker = segments[i+1]["speaker"]
+                method = "inherit_next"
+            else:
+                new_speaker = known_speakers[0]
+                method = "default_first"
+            
+            logger.debug(f"🔧 Correction: {current_speaker} → {new_speaker} ({method})")
+            
+            corrected_segment = segment.copy()
+            corrected_segment["speaker"] = new_speaker
+            corrected_segment["speaker_coverage"] = 0.1
+            corrected_segment["corrected"] = True
+            
+            validated_segments.append(corrected_segment)
+        else:
+            validated_segments.append(segment)
+    
+    if unknown_count > 0:
+        logger.info(f"✅ Validation: {unknown_count} segments corrigés")
+    
+    # Vérification finale
+    final_speakers = set(seg["speaker"] for seg in validated_segments)
+    if "SPEAKER_UNKNOWN" in final_speakers:
+        logger.error("❌ ERREUR: SPEAKER_UNKNOWN encore présent!")
+    else:
+        logger.info(f"✅ SUCCÈS: Speakers valides: {sorted(final_speakers)}")
+    
+    return validated_segments
+
+def transcribe_and_diarize(audio_path, num_speakers=None, min_speakers=2, max_speakers=4):
+    """Fonction principale - Version simplifiée et robuste"""
     try:
-        # ÉTAPE 1: Transcription améliorée
+        # ÉTAPE 1: Transcription
         transcription_result = transcribe_with_whisper(audio_path)
         if not transcription_result['success']:
             return transcription_result
-        
-        # Vérifier si on a des répétitions suspectes
-        repetition_warning = transcription_result.get('repetition_warning', False)
-        hallucination_detected = transcription_result.get('hallucination_detected', False)
-        
-        if hallucination_detected:
-            logger.warning("🚨 HALLUCINATION WHISPER DÉTECTÉE - Qualité audio dégradée")
-        elif repetition_warning:
-            logger.warning("⚠️ Répétitions détectées - Possible dégradation qualité")
         
         # ÉTAPE 2: Diarisation
         diarization_result = diarize_with_pyannote(
@@ -1095,38 +811,15 @@ def transcribe_and_diarize_separated(audio_path, num_speakers=None, min_speakers
         )
         
         if not diarization_result['success']:
-            logger.warning("⚠️ Diarisation échouée - Attribution automatique intelligente")
+            logger.warning("⚠️ Diarisation échouée - Attribution automatique")
             
-            # FALLBACK INTELLIGENT amélioré
+            # FALLBACK: Attribution automatique
             segments_with_auto_speakers = []
             target_speakers = num_speakers if num_speakers and num_speakers > 0 else 2
             speaker_names = [f"SPEAKER_{i:02d}" for i in range(target_speakers)]
             
-            logger.info(f"🔄 Attribution automatique sur {target_speakers} speakers: {speaker_names}")
-            
-            # Attribution intelligente basée sur les pauses
             for i, segment in enumerate(transcription_result["segments"]):
-                if target_speakers == 1:
-                    speaker_name = "SPEAKER_00"
-                else:
-                    # Logique améliorée d'alternance
-                    if i == 0:
-                        speaker_idx = 0
-                    else:
-                        prev_segment = segments_with_auto_speakers[-1]
-                        prev_duration = prev_segment["end"] - prev_segment["start"]
-                        prev_speaker_idx = int(prev_segment["speaker"].split("_")[1])
-                        
-                        # Pause entre segments
-                        pause_duration = segment["start"] - prev_segment["end"]
-                        
-                        # Changer de speaker si pause longue ou segment long précédent
-                        if pause_duration > 1.0 or prev_duration > 4.0 or i % 5 == 0:
-                            speaker_idx = (prev_speaker_idx + 1) % target_speakers
-                        else:
-                            speaker_idx = prev_speaker_idx
-                    
-                    speaker_name = speaker_names[speaker_idx]
+                speaker_name = speaker_names[i % target_speakers]
                 
                 segments_with_auto_speakers.append({
                     "start": segment["start"],
@@ -1134,8 +827,8 @@ def transcribe_and_diarize_separated(audio_path, num_speakers=None, min_speakers
                     "text": segment["text"],
                     "speaker": speaker_name,
                     "confidence": segment["confidence"],
-                    "speaker_coverage": 0.8,  # Confiance artificielle élevée
-                    "attribution_method": "auto_alternation_enhanced",
+                    "speaker_coverage": 0.8,
+                    "attribution_method": "auto_alternation",
                     "words": segment.get("words", [])
                 })
             
@@ -1146,59 +839,42 @@ def transcribe_and_diarize_separated(audio_path, num_speakers=None, min_speakers
                 'speakers_detected': len(set(seg["speaker"] for seg in segments_with_auto_speakers)),
                 'language': transcription_result["language"],
                 'diarization_available': False,
-                'warning': f'Diarisation échouée - attribution automatique: {diarization_result.get("error", "Erreur inconnue")}',
+                'warning': f'Diarisation échouée: {diarization_result.get("error", "Erreur inconnue")}',
                 'fallback_mode': True,
-                'repetition_warning': repetition_warning,
-                'hallucination_detected': hallucination_detected,
-                'final_speakers': sorted(set(seg["speaker"] for seg in segments_with_auto_speakers))
+                'repetition_warning': transcription_result.get('repetition_warning', False),
+                'hallucination_detected': transcription_result.get('hallucination_detected', False),
+                'final_speakers': sorted(set(seg["speaker"] for seg in segments_with_auto_speakers)),
+                'transcription_method': transcription_result.get('transcription_method', 'unknown'),
+                'word_timestamps_available': transcription_result.get('word_timestamps_available', False)
             }
         
-        # ÉTAPE 3: Attribution des speakers (diarisation réussie)
-        final_segments = assign_speakers_to_transcription_enhanced(
+        # ÉTAPE 3: Attribution des speakers
+        final_segments = assign_speakers_to_transcription(
             transcription_result["segments"],
             diarization_result["speaker_segments"]
         )
         
-        # VÉRIFICATION FINALE TRIPLE CONTRÔLE
+        # VÉRIFICATION FINALE
         final_speakers = set(seg["speaker"] for seg in final_segments)
         unknown_segments = [seg for seg in final_segments if seg["speaker"] == "SPEAKER_UNKNOWN"]
         
         if unknown_segments:
-            logger.error(f"❌ ERREUR CRITIQUE: {len(unknown_segments)} segments SPEAKER_UNKNOWN!")
-            
-            # CORRECTION D'URGENCE FINALE
+            logger.error(f"❌ {len(unknown_segments)} segments SPEAKER_UNKNOWN détectés!")
+            # Correction d'urgence
             known_speakers = [s for s in final_speakers if s != "SPEAKER_UNKNOWN"]
             if not known_speakers:
                 known_speakers = ["SPEAKER_00", "SPEAKER_01"]
-                logger.error("🚨 Création forcée SPEAKER_00/01")
             
-            # Forcer tous les SPEAKER_UNKNOWN
             for i, seg in enumerate(final_segments):
                 if seg["speaker"] == "SPEAKER_UNKNOWN":
                     new_speaker = known_speakers[i % len(known_speakers)]
-                    logger.error(f"🚨 CORRECTION: SPEAKER_UNKNOWN → {new_speaker}")
                     final_segments[i]["speaker"] = new_speaker
-                    final_segments[i]["speaker_coverage"] = 0.1
                     final_segments[i]["emergency_fix"] = True
-        
-        # VÉRIFICATION POST-CORRECTION
-        post_correction_speakers = set(seg["speaker"] for seg in final_segments)
-        post_unknown_count = sum(1 for seg in final_segments if seg["speaker"] == "SPEAKER_UNKNOWN")
-        
-        if post_unknown_count > 0:
-            logger.error(f"❌ ÉCHEC TOTAL: {post_unknown_count} SPEAKER_UNKNOWN!")
-            # En dernier recours
-            for seg in final_segments:
-                if seg["speaker"] == "SPEAKER_UNKNOWN":
-                    seg["speaker"] = "SPEAKER_00"
-                    seg["absolute_fallback"] = True
-        else:
-            logger.info(f"✅ SUCCÈS: Aucun SPEAKER_UNKNOWN")
         
         speakers_detected = len(set(seg["speaker"] for seg in final_segments))
         final_speaker_list = sorted(set(seg["speaker"] for seg in final_segments))
         
-        logger.info(f"🎉 Processus complet terminé: {speakers_detected} speakers")
+        logger.info(f"🎉 Processus terminé: {speakers_detected} speakers")
         logger.info(f"🎯 Speakers utilisés: {final_speaker_list}")
         
         return {
@@ -1212,59 +888,46 @@ def transcribe_and_diarize_separated(audio_path, num_speakers=None, min_speakers
             'diarization_params_used': diarization_result["diarization_params_used"],
             'fallback_mode': False,
             'final_speakers': final_speaker_list,
-            'repetition_warning': repetition_warning,
-            'hallucination_detected': hallucination_detected,
+            'repetition_warning': transcription_result.get('repetition_warning', False),
+            'hallucination_detected': transcription_result.get('hallucination_detected', False),
             'unknown_segments_corrected': len(unknown_segments) if unknown_segments else 0,
             'word_segments_count': transcription_result.get('word_segments_count', 0),
-            'filter_version': transcription_result.get('filter_version', 'v2.0')
+            'transcription_method': transcription_result.get('transcription_method', 'unknown'),
+            'word_timestamps_available': transcription_result.get('word_timestamps_available', False)
         }
         
     except Exception as e:
-        logger.error(f"❌ Erreur processus séparé: {e}")
+        logger.error(f"❌ Erreur processus principal: {e}")
         logger.error(f"🔍 Traceback: {traceback.format_exc()}")
         return {'success': False, 'error': str(e)}
 
 def create_formatted_transcript(segments):
-    """Crée un transcript formaté avec améliorations v2.0"""
+    """Crée un transcript formaté avec speakers"""
     if not segments:
         return "Aucune transcription disponible."
     
-    # Filtrer une dernière fois pour l'affichage
+    # Filtrer pour l'affichage
     display_segments = []
     for segment in segments:
         text = segment.get("text", "").strip()
         duration = segment.get("end", 0) - segment.get("start", 0)
         
-        # Critères d'affichage plus stricts
         if (text and 
-            text not in [".", ",", "!", "?", "...", "-", " ", "..."] and
             len(text) > 1 and
-            duration >= 0.4):  # Seuil légèrement réduit
+            duration >= 0.4):
             display_segments.append(segment)
     
     if not display_segments:
-        return "Aucun contenu parlé détecté dans cet audio."
-    
-    # Élimination finale des SPEAKER_UNKNOWN pour l'affichage
-    unknown_segments = [seg for seg in display_segments if seg.get("speaker") == "SPEAKER_UNKNOWN"]
-    if unknown_segments:
-        logger.warning(f"⚠️ {len(unknown_segments)} segments SPEAKER_UNKNOWN dans l'affichage - correction!")
-        for seg in display_segments:
-            if seg.get("speaker") == "SPEAKER_UNKNOWN":
-                seg["speaker"] = "SPEAKER_00"
+        return "Aucun contenu parlé détecté."
     
     # Statistiques par speaker
     speaker_stats = {}
     for segment in display_segments:
         speaker = segment["speaker"]
-        if speaker == "SPEAKER_UNKNOWN":
-            continue
-            
         if speaker not in speaker_stats:
             speaker_stats[speaker] = {
                 "total_time": 0,
                 "segments_count": 0,
-                "texts": [],
                 "avg_confidence": 0,
                 "avg_coverage": 0
             }
@@ -1272,7 +935,6 @@ def create_formatted_transcript(segments):
         duration = segment["end"] - segment["start"]
         speaker_stats[speaker]["total_time"] += duration
         speaker_stats[speaker]["segments_count"] += 1
-        speaker_stats[speaker]["texts"].append(segment["text"])
         speaker_stats[speaker]["avg_confidence"] += segment["confidence"]
         speaker_stats[speaker]["avg_coverage"] += segment.get("speaker_coverage", 0)
     
@@ -1286,9 +948,9 @@ def create_formatted_transcript(segments):
             stats["percentage"] = (stats["total_time"] / total_duration * 100) if total_duration > 0 else 0
     
     # Créer le transcript
-    lines = ["=== TRANSCRIPTION AVEC DIARISATION AMÉLIORÉE v2.0 (WhisperX-style) ===\n"]
+    lines = ["=== TRANSCRIPTION AVEC DIARISATION - VERSION MODERNE ===\n"]
     
-    # Statistiques détaillées
+    # Statistiques
     lines.append("📊 ANALYSE DES PARTICIPANTS:")
     for speaker, stats in speaker_stats.items():
         conf = int(stats["avg_confidence"] * 100)
@@ -1296,13 +958,7 @@ def create_formatted_transcript(segments):
         time_str = f"{stats['total_time']:.1f}s"
         percentage = f"{stats['percentage']:.1f}%"
         
-        # Indicateur de qualité amélioré
-        if coverage > 70:
-            quality_indicator = "✅"
-        elif coverage > 40:
-            quality_indicator = "⚠️"
-        else:
-            quality_indicator = "❌"
+        quality_indicator = "✅" if coverage > 70 else "⚠️" if coverage > 40 else "❌"
         
         lines.append(f"🗣️ {speaker}: {time_str} ({percentage}) - Confiance: {conf}% - Attribution: {coverage}% {quality_indicator}")
     
@@ -1311,37 +967,18 @@ def create_formatted_transcript(segments):
     lines.append(f"   ⏱️ Durée totale: {total_duration:.1f}s")
     lines.append(f"   🎯 Speakers identifiés: {len(speaker_stats)}")
     
-    # Améliorations v2.0
+    # Métriques avancées
     word_level_count = sum(1 for seg in display_segments if seg.get("attribution_method") == "word_level")
     if word_level_count > 0:
         lines.append(f"   🔤 Attribution mot-par-mot: {word_level_count}/{len(display_segments)} segments")
     
-    enhanced_count = sum(1 for seg in display_segments if seg.get("filter_version", "").startswith("v2.0"))
-    if enhanced_count > 0:
-        lines.append(f"   ✨ Filtrage amélioré v2.0: {enhanced_count}/{len(display_segments)} segments")
-    
-    # Détection problèmes
-    text_counts = {}
-    for seg in display_segments:
-        text = seg["text"]
-        text_counts[text] = text_counts.get(text, 0) + 1
-    
-    suspicious_repetitions = {text: count for text, count in text_counts.items() if count > 3}
-    if suspicious_repetitions:
-        lines.append(f"   ⚠️ Répétitions détectées: {len(suspicious_repetitions)} phrases répétées")
-    
     lines.append("\n" + "="*60)
     lines.append("📝 CONVERSATION CHRONOLOGIQUE:")
     
-    # Format conversation amélioré
+    # Format conversation
     current_speaker = None
     for segment in display_segments:
         speaker = segment["speaker"]
-        
-        # Assurance finale
-        if speaker == "SPEAKER_UNKNOWN":
-            speaker = "SPEAKER_00"
-        
         start_time = format_timestamp(segment["start"])
         end_time = format_timestamp(segment["end"])
         confidence = int(segment["confidence"] * 100)
@@ -1352,133 +989,40 @@ def create_formatted_transcript(segments):
             lines.append(f"\n👤 {speaker}:")
             current_speaker = speaker
         
-        # Indicateurs de qualité v2.0
+        # Indicateurs de qualité
         quality_icons = ""
         if segment.get("smoothed"):
-            quality_icons += "🔧"  # Lissé
-        if segment.get("emergency_fix") or segment.get("absolute_fallback"):
-            quality_icons += "🚨"  # Correction d'urgence
+            quality_icons += "🔧"
+        if segment.get("emergency_fix"):
+            quality_icons += "🚨"
         if segment.get("attribution_method") == "word_level":
-            quality_icons += "🔤"  # Attribution mot-par-mot
-        if segment.get("filter_version", "").startswith("v2.0"):
-            quality_icons += "✨"  # Filtrage v2.0
+            quality_icons += "🔤"
         if coverage < 30:
-            quality_icons += "❓"  # Attribution très incertaine
-        elif coverage < 60:
-            quality_icons += "⚠️"  # Attribution incertaine
+            quality_icons += "❓"
         
-        # Indicateur de confiance audio
-        if confidence < 40:
-            quality_icons += "🔇"  # Confiance très faible
-        elif confidence < 70:
-            quality_icons += "🔉"  # Confiance moyenne
-        
-        # Couleurs de confiance
         confidence_color = "🟢" if confidence > 70 else "🟡" if confidence > 40 else "🔴"
         coverage_color = "🟢" if coverage > 60 else "🟡" if coverage > 30 else "🔴"
         
         lines.append(f"   [{start_time}-{end_time}] {segment['text']}")
         lines.append(f"      └─ {confidence_color}Conf:{confidence}% {coverage_color}Attr:{coverage}% {quality_icons}")
     
-    # Résumé final amélioré
+    # Résumé final
     lines.append(f"\n" + "="*60)
-    lines.append(f"📊 RÉSUMÉ v2.0:")
+    lines.append(f"📊 RÉSUMÉ:")
     
-    # Qualité globale
     avg_confidence = sum(seg["confidence"] for seg in display_segments) / len(display_segments) * 100
     avg_coverage = sum(seg.get("speaker_coverage", 0) for seg in display_segments) / len(display_segments) * 100
     
     lines.append(f"   🎯 Qualité transcription: {avg_confidence:.0f}%")
     lines.append(f"   🎭 Qualité diarisation: {avg_coverage:.0f}%")
     
-    # Nouvelles métriques v2.0
     if word_level_count > 0:
         lines.append(f"   ✨ Attribution précise: {word_level_count}/{len(display_segments)} segments")
     
-    if enhanced_count > 0:
-        lines.append(f"   🚀 Filtrage amélioré: {enhanced_count}/{len(display_segments)} segments")
-    
-    # Détection de corrections appliquées
-    corrections_count = sum(1 for seg in display_segments if seg.get("smoothed") or seg.get("emergency_fix"))
-    if corrections_count > 0:
-        lines.append(f"   🔧 Corrections appliquées: {corrections_count} segments")
-    
-    # Recommandations améliorées
-    if avg_confidence < 50:
-        lines.append(f"   💡 Audio de qualité faible - vérifiez le contenu")
-    if avg_coverage < 40:
-        lines.append(f"   💡 Diarisation incertaine - possibles erreurs d'attribution")
-    if suspicious_repetitions:
-        lines.append(f"   💡 Attention: Répétitions détectées - possible hallucination Whisper")
-    
     return "\n".join(lines)
 
-def post_process_quality_check(result):
-    """Contrôle qualité final avant retour - Version v2.0"""
-    segments = result.get("segments", [])
-    
-    # Vérifications critiques améliorées
-    checks = {
-        "no_unknown_speakers": all(seg.get("speaker") != "SPEAKER_UNKNOWN" for seg in segments),
-        "valid_timestamps": all(seg.get("start", 0) < seg.get("end", 0) for seg in segments),
-        "non_empty_text": all(seg.get("text", "").strip() for seg in segments),
-        "reasonable_durations": all(0.1 <= (seg.get("end", 0) - seg.get("start", 0)) <= 30 for seg in segments),
-        "valid_speakers": all(seg.get("speaker", "").startswith("SPEAKER_") for seg in segments),
-        "minimum_coverage": all(seg.get("speaker_coverage", 0) >= 0 for seg in segments)
-    }
-    
-    logger.info("🔍 Contrôle qualité final v2.0:")
-    for check, passed in checks.items():
-        status = "✅" if passed else "❌"
-        logger.info(f"   {status} {check}")
-    
-    # Corrections d'urgence si nécessaire
-    emergency_fixes = 0
-    
-    if not checks["no_unknown_speakers"]:
-        logger.error("🚨 Correction d'urgence SPEAKER_UNKNOWN...")
-        for seg in segments:
-            if seg.get("speaker") == "SPEAKER_UNKNOWN":
-                seg["speaker"] = "SPEAKER_00"
-                seg["emergency_final_fix"] = True
-                emergency_fixes += 1
-    
-    if not checks["valid_speakers"]:
-        logger.error("🚨 Correction speakers invalides...")
-        for seg in segments:
-            if not seg.get("speaker", "").startswith("SPEAKER_"):
-                seg["speaker"] = "SPEAKER_00"
-                seg["speaker_format_fix"] = True
-                emergency_fixes += 1
-    
-    # Statistiques de qualité améliorées
-    if segments:
-        avg_coverage = sum(seg.get("speaker_coverage", 0) for seg in segments) / len(segments)
-        avg_confidence = sum(seg.get("confidence", 0) for seg in segments) / len(segments)
-        word_level_segments = sum(1 for seg in segments if seg.get("attribution_method") == "word_level")
-        enhanced_segments = sum(1 for seg in segments if seg.get("filter_version", "").startswith("v2.0"))
-        
-        result["quality_metrics"] = {
-            "avg_speaker_coverage": avg_coverage,
-            "avg_transcription_confidence": avg_confidence,
-            "total_segments": len(segments),
-            "quality_checks_passed": sum(checks.values()),
-            "quality_score": sum(checks.values()) / len(checks),
-            "word_level_segments": word_level_segments,
-            "enhanced_segments": enhanced_segments,
-            "emergency_fixes_applied": emergency_fixes
-        }
-        
-        quality_score = result["quality_metrics"]["quality_score"]
-        logger.info(f"📊 Score qualité global: {quality_score:.1%}")
-        
-        if quality_score < 0.8:
-            logger.warning(f"⚠️ Qualité sous-optimale détectée: {quality_score:.1%}")
-    
-    return result
-
 def handler(event):
-    """Handler principal RunPod avec améliorations v2.0 - Garantit aucun SPEAKER_UNKNOWN"""
+    """Handler principal RunPod - Version moderne et simplifiée"""
     try:
         # Chargement des modèles si nécessaire
         if whisper_model is None or diarization_pipeline is None:
@@ -1496,7 +1040,7 @@ def handler(event):
         min_speakers = job_input.get("min_speakers", 2)
         max_speakers = job_input.get("max_speakers", 3)
         
-        logger.info(f"🚀 Début traitement v2.0: {audio_url}")
+        logger.info(f"🚀 Début traitement moderne: {audio_url}")
         logger.info(f"👥 Paramètres: num={num_speakers}, min={min_speakers}, max={max_speakers}")
         logger.info(f"🎮 Status modèles: Whisper={'✅' if whisper_model else '❌'} Pyannote={'✅' if diarization_pipeline else '❌'}")
         
@@ -1506,8 +1050,8 @@ def handler(event):
             return {"error": f"Erreur téléchargement: {download_error}"}
         
         try:
-            # Transcription + Diarisation avec processus séparés v2.0
-            result = transcribe_and_diarize_separated(
+            # Transcription + Diarisation
+            result = transcribe_and_diarize(
                 audio_path,
                 num_speakers=num_speakers,
                 min_speakers=min_speakers,
@@ -1517,27 +1061,22 @@ def handler(event):
             if not result['success']:
                 return {"error": f"Erreur traitement: {result.get('error', 'Erreur inconnue')}"}
             
-            # Contrôle qualité final
-            result = post_process_quality_check(result)
-            
-            # VÉRIFICATION FINALE CÔTÉ HANDLER v2.0
+            # VÉRIFICATION FINALE
             segments = result.get('segments', [])
             final_speakers = set(seg.get("speaker") for seg in segments)
             unknown_count = sum(1 for seg in segments if seg.get("speaker") == "SPEAKER_UNKNOWN")
             
             if unknown_count > 0:
-                logger.error(f"🚨 HANDLER v2.0: {unknown_count} SPEAKER_UNKNOWN détectés!")
-                # Dernière correction possible
+                logger.error(f"🚨 {unknown_count} SPEAKER_UNKNOWN détectés - correction finale!")
                 for seg in segments:
                     if seg.get("speaker") == "SPEAKER_UNKNOWN":
                         seg["speaker"] = "SPEAKER_00"
-                        seg["handler_emergency_fix"] = True
-                logger.error(f"🚨 HANDLER v2.0: Correction d'urgence appliquée")
+                        seg["final_emergency_fix"] = True
             
             # Création du transcript formaté
             formatted_transcript = create_formatted_transcript(result['segments'])
             
-            # Construction réponse finale avec améliorations v2.0
+            # Construction réponse finale
             response = {
                 "transcription": result['transcription'],
                 "transcription_formatee": formatted_transcript,
@@ -1546,81 +1085,53 @@ def handler(event):
                 "language": result['language'],
                 "diarization_available": result['diarization_available'],
                 "device": str(device),
-                "model": "whisper-large-v2-enhanced-v2.0" if whisper_model else "whisper-unavailable",
+                "model": "whisper-large-v2-modern",
                 "pyannote_model": "speaker-diarization-3.1" if diarization_pipeline else "unavailable",
-                "processing_method": "whisperx_style_separated_processes_v2.0",
+                "processing_method": "modern_direct_approach",
                 "enhancements": {
-                    "word_level_timestamps": True,
-                    "word_level_speaker_attribution": True,
+                    "word_level_timestamps": result.get('word_timestamps_available', False),
+                    "word_level_speaker_attribution": result.get('word_timestamps_available', False),
                     "gpu_optimizations": torch.cuda.is_available(),
-                    "enhanced_smoothing": True,
-                    "advanced_filtering": True,
-                    "hallucination_detection": True,
-                    "quality_control": True
+                    "intelligent_filtering": True,
+                    "hallucination_detection": True
                 },
                 "success": True
             }
             
-            # Infos de debug et qualité améliorées v2.0
+            # Métriques détaillées
             if 'speakers_found_by_diarization' in result:
                 response['speakers_found_by_diarization'] = result['speakers_found_by_diarization']
             if 'diarization_params_used' in result:
                 response['diarization_params_used'] = result['diarization_params_used']
             if 'warning' in result:
                 response['warning'] = result['warning']
-            
-            # Nouvelles métriques v2.0
             if 'repetition_warning' in result and result['repetition_warning']:
                 response['repetition_warning'] = True
             if 'hallucination_detected' in result and result['hallucination_detected']:
                 response['hallucination_detected'] = True
-                response['warning'] = (response.get('warning', '') + ' ATTENTION: Hallucination Whisper détectée.').strip()
-            if 'unknown_segments_corrected' in result:
-                response['unknown_segments_corrected'] = result['unknown_segments_corrected']
             if 'final_speakers' in result:
                 response['final_speakers'] = result['final_speakers']
-            if 'filter_version' in result:
-                response['filter_version'] = result['filter_version']
+            if 'transcription_method' in result:
+                response['transcription_method'] = result['transcription_method']
+            if 'word_timestamps_available' in result:
+                response['word_timestamps_available'] = result['word_timestamps_available']
             
-            # Métriques qualité
-            if 'quality_metrics' in result:
-                response['quality_metrics'] = result['quality_metrics']
-            
-            # Nouvelles métriques WhisperX-style v2.0
-            if 'word_segments_count' in result:
-                response['word_level_segments'] = result['word_segments_count']
-                response['word_level_coverage'] = f"{result['word_segments_count']}/{len(result.get('segments', []))}"
-            
-            # Compter segments avec attribution mot-par-mot
-            word_level_attributions = sum(1 for seg in result.get('segments', []) if seg.get('attribution_method') == 'word_level')
-            if word_level_attributions > 0:
-                response['word_level_attributions'] = word_level_attributions
-                response['attribution_quality'] = f"{word_level_attributions}/{len(result.get('segments', []))} segments avec attribution précise"
-            
-            # Logs de succès avec détails améliorés v2.0
-            logger.info(f"✅ Traitement réussi (WhisperX-enhanced v2.0):")
+            # Logs de succès
+            logger.info(f"✅ Traitement réussi (version moderne):")
             logger.info(f"   📝 Segments: {len(result.get('segments', []))}")
             logger.info(f"   🗣️ Speakers: {result.get('speakers_detected', 0)}")
             logger.info(f"   🎯 Speakers finaux: {result.get('final_speakers', 'unknown')}")
             logger.info(f"   🎭 Diarisation: {'✅' if result.get('diarization_available') else '❌'}")
-            logger.info(f"   🔤 Segments avec mots: {result.get('word_segments_count', 0)}")
-            logger.info(f"   ✨ Filtrage v2.0: {result.get('filter_version', 'unknown')}")
-            logger.info(f"   ⚠️ Répétitions: {'⚠️' if result.get('repetition_warning') else '✅'}")
-            logger.info(f"   🚨 Hallucinations: {'⚠️' if result.get('hallucination_detected') else '✅'}")
-            logger.info(f"   🔧 Corrections UNKNOWN: {result.get('unknown_segments_corrected', 0)}")
+            logger.info(f"   🔤 Word timestamps: {'✅' if result.get('word_timestamps_available') else '❌'}")
+            logger.info(f"   🎯 Méthode: {result.get('transcription_method', 'unknown')}")
             
-            if 'quality_metrics' in result:
-                qm = result['quality_metrics']
-                logger.info(f"   📊 Score qualité: {qm.get('quality_score', 0):.1%}")
-                logger.info(f"   🔧 Corrections d'urgence: {qm.get('emergency_fixes_applied', 0)}")
-            
-            # Nettoyage GPU après traitement
+            # Nettoyage GPU
             cleanup_gpu_memory()
             
             return response
             
         finally:
-            # Nettoyage
+            # Nettoyage fichier
             try:
                 if audio_path and os.path.exists(audio_path):
                     os.unlink(audio_path)
@@ -1629,84 +1140,41 @@ def handler(event):
                 logger.warning(f"⚠️ Erreur nettoyage: {cleanup_error}")
         
     except Exception as e:
-        logger.error(f"❌ Erreur handler v2.0: {e}")
+        logger.error(f"❌ Erreur handler: {e}")
         logger.error(f"🔍 Traceback: {traceback.format_exc()}")
         return {"error": f"Erreur interne: {str(e)}"}
 
 if __name__ == "__main__":
-    logger.info("🚀 Démarrage RunPod Serverless - Transcription + Diarisation AMÉLIORÉE v2.0")
-    logger.info("✨ Fonctionnalités WhisperX-style v2.0:")
+    logger.info("🚀 Démarrage RunPod Serverless - Version MODERNE")
+    logger.info("✨ Fonctionnalités modernes:")
+    logger.info("   - Support total transformers 4.52.4")
+    logger.info("   - Word timestamps natifs")
     logger.info("   - Attribution niveau mot-par-mot")
-    logger.info("   - Timestamps précis des mots")
     logger.info("   - Optimisations GPU avancées")
-    logger.info("   - Lissage intelligent des speakers")
-    logger.info("   - Élimination garantie des SPEAKER_UNKNOWN")
-    logger.info("   - Détection et filtrage des hallucinations Whisper")
-    logger.info("   - Filtrage adaptatif selon la durée audio")
-    logger.info("   - Validation renforcée de la cohérence speakers")
-    logger.info("   - Contrôle qualité multi-niveaux")
-    logger.info("   - Attribution automatique intelligente en fallback")
-    logger.info("   - Gestion robuste des incompatibilités de versions")
-    
-    # Diagnostic des versions pour éviter les erreurs
-    try:
-        import transformers
-        import whisper
-        logger.info(f"📦 Versions détectées:")
-        logger.info(f"   - Whisper: {whisper.__version__ if hasattr(whisper, '__version__') else 'unknown'}")
-        logger.info(f"   - Transformers: {transformers.__version__}")
-        logger.info(f"   - PyTorch: {torch.__version__}")
-        
-        # Avertissements sur les incompatibilités connues
-        transformers_version = transformers.__version__
-        if transformers_version.startswith("4.21") or transformers_version.startswith("4.22"):
-            logger.warning("⚠️ Version Transformers potentiellement incompatible avec word_timestamps")
-            logger.info("💡 Si erreurs 'src', le fallback automatique sera utilisé")
-        
-    except Exception as version_error:
-        logger.warning(f"⚠️ Impossible de vérifier les versions: {version_error}")
+    logger.info("   - Élimination garantie SPEAKER_UNKNOWN")
+    logger.info("   - Détection hallucinations Whisper")
+    logger.info("   - Filtrage intelligent adaptatif")
+    logger.info("   - Code simplifié et robuste")
     
     logger.info("⏳ Chargement initial des modèles...")
     
     try:
         load_models()
         if whisper_model:
-            logger.info("✅ Whisper large-v2 prêt avec améliorations v2.0")
-            logger.info("🔧 Stratégies de transcription disponibles:")
-            logger.info("   1. word_timestamps_full (optimal)")
-            logger.info("   2. word_timestamps_basic (compatible)")
-            logger.info("   3. standard_optimized (fallback)")
-            logger.info("   4. minimal_safe (dernier recours)")
+            logger.info("✅ Whisper large-v2 prêt (version moderne)")
         else:
             logger.error("❌ Whisper non chargé")
             
         if diarization_pipeline:
-            logger.info("✅ Pyannote prêt avec optimisations")
+            logger.info("✅ Pyannote prêt")
         else:
             logger.warning("⚠️ Pyannote non disponible - mode transcription seule")
             
-        logger.info("✅ Service prêt avec améliorations WhisperX-style v2.0")
-        logger.info("🔧 Nouvelles fonctionnalités:")
-        logger.info("   - Détection hallucinations Whisper en temps réel")
-        logger.info("   - Filtrage adaptatif selon durée audio")
-        logger.info("   - Attribution automatique intelligente")
-        logger.info("   - Métriques de qualité avancées")
-        logger.info("   - Corrections d'urgence multi-niveaux")
-        logger.info("   - Gestion robuste des erreurs de compatibilité")
+        logger.info("✅ Service prêt avec support complet des dernières versions")
         
     except Exception as startup_error:
         logger.error(f"❌ Erreur chargement initial: {startup_error}")
         logger.info("⚠️ Démarrage en mode dégradé")
-        
-        # Diagnostic détaillé en cas d'erreur
-        if "src" in str(startup_error):
-            logger.error("🚨 PROBLÈME DE COMPATIBILITÉ DÉTECTÉ:")
-            logger.error("   - Erreur liée aux versions Whisper/Transformers")
-            logger.error("   - Solutions possibles:")
-            logger.error("     1. pip install --upgrade transformers")
-            logger.error("     2. pip install transformers==4.19.2")
-            logger.error("     3. pip install --upgrade openai-whisper")
-            logger.error("   - Le service utilisera les fallbacks automatiques")
     
     # Démarrage du serveur RunPod
     runpod.serverless.start({"handler": handler})
