@@ -1,7 +1,7 @@
 runpod
 torch
 torchaudio
-openai-whisper
+faster-whisper
 pyannote.audio
 transformers
 huggingface-hub
