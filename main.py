@@ -206,7 +206,22 @@ def load_models():
                 logger.info("   - Vous avez accepté les conditions")
             diarization_pipeline = None
 
-def format_timestamp(seconds):
+def safe_text_for_logging(text, max_length=40):
+    """Sécurise le texte pour l'affichage dans les logs"""
+    if not text:
+        return "VIDE"
+    
+    # Nettoyer les caractères problématiques
+    safe_text = str(text).replace('\n', ' ').replace('\r', ' ').replace('\t', ' ')
+    
+    # Supprimer les caractères de contrôle
+    safe_text = ''.join(char for char in safe_text if ord(char) >= 32 or char in [' '])
+    
+    # Tronquer si nécessaire
+    if len(safe_text) > max_length:
+        safe_text = safe_text[:max_length] + "..."
+    
+    return safe_text
     """Convertit les secondes en format mm:ss"""
     return str(timedelta(seconds=int(seconds)))[2:]
 
@@ -348,7 +363,7 @@ def improved_segment_filtering(segments_raw):
         if duration > 0:
             words_per_second = words_count / duration
             if words_per_second > max_words_per_second or words_per_second < 0.2:
-                logger.info(f"🔥 Vitesse anormale: {words_per_second:.1f} mots/s - '{text[:30]}...'")
+                logger.info(f"🔥 Vitesse anormale: {words_per_second:.1f} mots/s - '{safe_text_for_logging(text)}'")
                 continue
         
         # 5. NOUVEAU: Détection patterns répétitifs consécutifs
@@ -358,14 +373,14 @@ def improved_segment_filtering(segments_raw):
             same_count = recent_texts.count(text)
             
             if same_count >= 3:
-                logger.info(f"🔥 Pattern répétitif: '{text[:40]}...' ({same_count} dans les 5 derniers)")
+                logger.info(f"🔥 Pattern répétitif: '{safe_text_for_logging(text)}' ({same_count} dans les 5 derniers)")
                 continue
                 
             # Pattern A-B-A-B détecté ?
             if (len(recent_texts) >= 3 and 
                 recent_texts[-1] == recent_texts[-3] and
                 text == recent_texts[-1]):
-                logger.info(f"🔥 Pattern A-B-A-B: '{text[:30]}...'")
+                logger.info(f"🔥 Pattern A-B-A-B: '{safe_text_for_logging(text)}'")
                 continue
         
         # 6. Validation timestamps renforcée
@@ -383,12 +398,12 @@ def improved_segment_filtering(segments_raw):
             if overlap > 0.9 * min(duration, last_seg["end"] - last_seg["start"]):
                 text_similarity = len(set(text.split()) & set(last_seg["text"].split())) / max(len(text.split()), 1)
                 if text_similarity > 0.8:
-                    logger.info(f"🔥 Doublon temporal/textuel: '{text[:30]}...'")
+                    logger.info(f"🔥 Doublon temporal/textuel: '{safe_text_for_logging(text)}'")
                     continue
             
             # Gap anormalement petit entre segments différents
             if 0 < gap < 0.1 and text != last_seg["text"] and duration < 1.0:
-                logger.info(f"🔥 Segment fragmenté: '{text[:30]}...'")
+                logger.info(f"🔥 Segment fragmenté: '{safe_text_for_logging(text)}'")
                 continue
         
         # 8. NOUVEAU: Filtrage par cohérence sémantique
@@ -403,7 +418,7 @@ def improved_segment_filtering(segments_raw):
             
             # Si aucun mot en commun avec le contexte ET segment très court
             if context_overlap == 0 and duration < 1.5 and len(current_words) <= 2:
-                logger.info(f"🔥 Segment hors contexte: '{text[:30]}...'")
+                logger.info(f"🔥 Segment hors contexte: '{safe_text_for_logging(text)}'")
                 continue
         
         # SEGMENT VALIDE - Enrichissement des données
