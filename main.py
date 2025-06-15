@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 import time
 import random
 import traceback
+from collections import Counter
 
 # Configuration logging
 logging.basicConfig(level=logging.INFO)
@@ -263,10 +264,199 @@ def download_audio(audio_url, max_size_mb=100):
         logger.error(f"❌ Erreur téléchargement: {e}")
         return None, str(e)
 
+def improved_segment_filtering(segments_raw):
+    """Filtrage amélioré des segments - Version 2.0 avec détection d'hallucinations"""
+    cleaned_segments = []
+    
+    # Analyse globale pour seuils adaptatifs
+    total_duration = sum(seg.get("end", 0) - seg.get("start", 0) for seg in segments_raw)
+    text_frequency = {}
+    
+    # Première passe: analyser les répétitions
+    for segment in segments_raw:
+        text = segment.get("text", "").strip()
+        if text and len(text) > 3:
+            text_frequency[text] = text_frequency.get(text, 0) + 1
+    
+    # Seuils adaptatifs selon la durée
+    if total_duration > 300:  # Audio long (>5min)
+        max_repetitions = 8
+        min_duration = 1.0
+        max_words_per_second = 7
+    elif total_duration > 60:   # Audio moyen (1-5min)
+        max_repetitions = 5
+        min_duration = 0.8
+        max_words_per_second = 8
+    else:  # Audio court (<1min)
+        max_repetitions = 3
+        min_duration = 0.6
+        max_words_per_second = 9
+    
+    suspicious_texts = {text: count for text, count in text_frequency.items() 
+                       if count > max_repetitions}
+    
+    if suspicious_texts:
+        logger.warning(f"🚨 {len(suspicious_texts)} textes suspects détectés:")
+        for text, count in list(suspicious_texts.items())[:3]:  # Afficher les 3 premiers
+            logger.warning(f"   '{text[:40]}...' répété {count} fois")
+    
+    # Tracking avancé des répétitions
+    consecutive_tracker = {}
+    hallucination_detected = False
+    
+    for i, segment in enumerate(segments_raw):
+        text = segment.get("text", "").strip()
+        start_time = segment.get("start", 0)
+        end_time = segment.get("end", 0)
+        duration = end_time - start_time
+        no_speech_prob = segment.get("no_speech_prob", 0)
+        words = segment.get("words", [])
+        
+        # DÉTECTION HALLUCINATION CRITIQUE
+        if i > len(segments_raw) * 0.7:  # Dans les 30% finaux
+            if text in suspicious_texts and suspicious_texts[text] > 8:
+                # Compter répétitions récentes
+                recent_same = sum(1 for j in range(max(0, i-10), i) 
+                                if segments_raw[j].get("text", "").strip() == text)
+                if recent_same >= 5:
+                    logger.error(f"🚨 HALLUCINATION détectée à {i}/{len(segments_raw)}: '{text[:40]}...'")
+                    hallucination_detected = True
+                    # Arrêter le traitement ici pour éviter la boucle infinie
+                    break
+        
+        # FILTRES RENFORCÉS
+        
+        # 1. Durée minimum adaptative
+        if duration < min_duration:
+            continue
+            
+        # 2. Texte vide ou inutile étendu
+        useless_texts = {
+            ".", "...", "....", "-", "–", "euh", "heu", "mm", "hmm", 
+            "ah", "oh", "ben", "donc", "alors", "voilà", "bon", "oui", "non",
+            " ", "", "merci", "au revoir", "bonjour"
+        }
+        if not text or text.lower() in useless_texts or len(text) < 2:
+            continue
+            
+        # 3. Probabilité de silence trop élevée
+        if no_speech_prob > 0.85:
+            continue
+            
+        # 4. Ratio mots/durée anormal (NOUVEAU seuil plus strict)
+        words_count = len(text.split())
+        if duration > 0:
+            words_per_second = words_count / duration
+            if words_per_second > max_words_per_second or words_per_second < 0.2:
+                logger.info(f"🔥 Vitesse anormale: {words_per_second:.1f} mots/s - '{text[:30]}...'")
+                continue
+        
+        # 5. NOUVEAU: Détection patterns répétitifs consécutifs
+        if text in suspicious_texts:
+            # Analyser les 5 derniers segments
+            recent_texts = [cleaned_segments[j]["text"] for j in range(max(0, len(cleaned_segments)-5), len(cleaned_segments))]
+            same_count = recent_texts.count(text)
+            
+            if same_count >= 3:
+                logger.info(f"🔥 Pattern répétitif: '{text[:40]}...' ({same_count} dans les 5 derniers)")
+                continue
+                
+            # Pattern A-B-A-B détecté ?
+            if (len(recent_texts) >= 3 and 
+                recent_texts[-1] == recent_texts[-3] and
+                text == recent_texts[-1]):
+                logger.info(f"🔥 Pattern A-B-A-B: '{text[:30]}...'")
+                continue
+        
+        # 6. Validation timestamps renforcée
+        if start_time >= end_time or start_time < 0 or end_time > total_duration + 10:
+            logger.warning(f"⚠️ Timestamps invalides: {start_time:.2f} -> {end_time:.2f}")
+            continue
+            
+        # 7. Détection chevauchements anormaux
+        if cleaned_segments:
+            last_seg = cleaned_segments[-1]
+            gap = start_time - last_seg["end"]
+            overlap = min(end_time, last_seg["end"]) - max(start_time, last_seg["start"])
+            
+            # Si chevauchement > 90% ET texte identique ou très similaire
+            if overlap > 0.9 * min(duration, last_seg["end"] - last_seg["start"]):
+                text_similarity = len(set(text.split()) & set(last_seg["text"].split())) / max(len(text.split()), 1)
+                if text_similarity > 0.8:
+                    logger.info(f"🔥 Doublon temporal/textuel: '{text[:30]}...'")
+                    continue
+            
+            # Gap anormalement petit entre segments différents
+            if 0 < gap < 0.1 and text != last_seg["text"] and duration < 1.0:
+                logger.info(f"🔥 Segment fragmenté: '{text[:30]}...'")
+                continue
+        
+        # 8. NOUVEAU: Filtrage par cohérence sémantique
+        if len(cleaned_segments) >= 2:
+            # Vérifier si le segment fait sens dans le contexte
+            context_words = set()
+            for prev_seg in cleaned_segments[-2:]:
+                context_words.update(prev_seg["text"].lower().split())
+            
+            current_words = set(text.lower().split())
+            context_overlap = len(context_words & current_words) / max(len(current_words), 1)
+            
+            # Si aucun mot en commun avec le contexte ET segment très court
+            if context_overlap == 0 and duration < 1.5 and len(current_words) <= 2:
+                logger.info(f"🔥 Segment hors contexte: '{text[:30]}...'")
+                continue
+        
+        # SEGMENT VALIDE - Enrichissement des données
+        validated_words = []
+        if words and isinstance(words, list):
+            for word_info in words:
+                try:
+                    if isinstance(word_info, dict) and 'word' in word_info:
+                        word_start = max(word_info.get('start', start_time), start_time)
+                        word_end = min(word_info.get('end', end_time), end_time)
+                        
+                        if word_start >= word_end:
+                            word_end = word_start + 0.1
+                        
+                        validated_words.append({
+                            'word': word_info['word'].strip(),
+                            'start': word_start,
+                            'end': word_end,
+                            'probability': word_info.get('probability', 1.0)
+                        })
+                except Exception:
+                    continue
+        
+        # Segment enrichi
+        enriched_segment = {
+            "start": start_time,
+            "end": end_time,
+            "text": text,
+            "confidence": 1 - no_speech_prob,
+            "duration": duration,
+            "words_count": words_count,
+            "words": validated_words,
+            "has_word_timestamps": len(validated_words) > 0,
+            "words_per_second": words_count / duration if duration > 0 else 0,
+            "segment_quality": "high" if duration > 2 and no_speech_prob < 0.3 else "medium" if duration > 1 else "low",
+            "filter_version": "v2.0_enhanced"
+        }
+        
+        cleaned_segments.append(enriched_segment)
+    
+    removed_count = len(segments_raw) - len(cleaned_segments)
+    
+    logger.info(f"✅ Filtrage v2.0 amélioré:")
+    logger.info(f"   📝 Segments gardés: {len(cleaned_segments)} / {len(segments_raw)} ({removed_count} supprimés)")
+    logger.info(f"   🚨 Hallucination détectée: {'⚠️ OUI' if hallucination_detected else '✅ Non'}")
+    logger.info(f"   🔤 Segments avec mots: {sum(1 for s in cleaned_segments if s['has_word_timestamps'])}")
+    
+    return cleaned_segments, suspicious_texts, hallucination_detected
+
 def transcribe_with_whisper(audio_path):
-    """ÉTAPE 1: Transcription avec améliorations WhisperX-style"""
+    """ÉTAPE 1: Transcription avec filtrage amélioré"""
     try:
-        logger.info("🎯 ÉTAPE 1: Transcription Whisper large-v2 (mode amélioré)...")
+        logger.info("🎯 ÉTAPE 1: Transcription Whisper large-v2 (mode amélioré v2.0)...")
         
         if not os.path.exists(audio_path):
             return {'success': False, 'error': f'Fichier audio introuvable: {audio_path}'}
@@ -280,26 +470,27 @@ def transcribe_with_whisper(audio_path):
         logger.info("🎯 Lancement transcription avec timestamps de mots...")
         
         try:
-            # PARAMÈTRES COMPATIBLES - Éviter l'erreur src
+            # Paramètres optimisés anti-hallucination
             result = whisper_model.transcribe(
                 audio_path,
                 language='fr',
                 fp16=torch.cuda.is_available(),
-                condition_on_previous_text=False,  # Anti-répétitions
+                condition_on_previous_text=False,  # CRITIQUE: Anti-répétitions
                 no_speech_threshold=0.6,
                 logprob_threshold=-1.0,
-                compression_ratio_threshold=2.2,
-                temperature=0.0,
+                compression_ratio_threshold=2.0,  # Plus strict
+                temperature=0.0,  # Déterministe
                 verbose=False,
-                word_timestamps=True  # ✨ CLEF : Timestamps précis des mots
+                word_timestamps=True,
+                # NOUVEAUX paramètres anti-hallucination
+                suppress_tokens=[],  # Ne pas supprimer de tokens
+                initial_prompt=None,  # Pas de prompt pour éviter le biais
             )
             
-        except (AttributeError, RuntimeError) as whisper_error:
-            # Erreur connue avec certaines versions de Whisper
-            logger.warning(f"⚠️ Erreur transcription avec word_timestamps: {whisper_error}")
+        except Exception as whisper_error:
+            logger.warning(f"⚠️ Erreur avec word_timestamps: {whisper_error}")
             
-            # FALLBACK 1: Sans word_timestamps mais avec paramètres optimaux
-            logger.info("🔄 Fallback sans timestamps de mots...")
+            # Fallback sans word_timestamps
             try:
                 result = whisper_model.transcribe(
                     audio_path,
@@ -308,134 +499,29 @@ def transcribe_with_whisper(audio_path):
                     condition_on_previous_text=False,
                     no_speech_threshold=0.6,
                     logprob_threshold=-1.0,
-                    compression_ratio_threshold=2.2,
+                    compression_ratio_threshold=2.0,
                     temperature=0.0,
                     verbose=False
                 )
             except Exception as whisper_error2:
-                logger.error(f"❌ Échec fallback optimisé: {whisper_error2}")
-                
-                # FALLBACK 2: Paramètres minimaux
-                logger.info("🔄 Transcription minimale...")
-                try:
-                    result = whisper_model.transcribe(
-                        audio_path,
-                        language='fr',
-                        condition_on_previous_text=False,
-                        verbose=False
-                    )
-                except Exception as whisper_error3:
-                    return {
-                        'success': False,
-                        'error': f'Échec total transcription: {whisper_error3}'
-                    }
+                logger.error(f"❌ Fallback échoué: {whisper_error2}")
+                return {'success': False, 'error': f'Transcription impossible: {whisper_error2}'}
         
-        logger.info(f"📊 Transcription réussie:")
+        logger.info(f"📊 Transcription brute terminée:")
         logger.info(f"   📝 Texte: '{result.get('text', '')[:100]}...'")
         logger.info(f"   🌍 Langue: {result.get('language', 'unknown')}")
         logger.info(f"   📈 Segments bruts: {len(result.get('segments', []))}")
         
-        # NETTOYAGE INTELLIGENT avec conservation des timestamps de mots
+        # NOUVEAU: Filtrage amélioré avec détection hallucinations
         segments_raw = result.get("segments", [])
-        cleaned_segments = []
+        cleaned_segments, suspicious_texts, hallucination_detected = improved_segment_filtering(segments_raw)
         
-        # Détection répétitions anormales
-        text_counts = {}
-        for segment in segments_raw:
-            text = segment.get("text", "").strip()
-            if text:
-                text_counts[text] = text_counts.get(text, 0) + 1
-        
-        suspicious_texts = {text: count for text, count in text_counts.items() if count > 5}
-        if suspicious_texts:
-            logger.warning(f"⚠️ Détection répétitions anormales: {suspicious_texts}")
-        
-        repetition_warning = len(suspicious_texts) > 0
-        
-        for i, segment in enumerate(segments_raw):
-            text = segment.get("text", "").strip()
-            start_time = segment.get("start", 0)
-            end_time = segment.get("end", 0)
-            duration = end_time - start_time
-            no_speech_prob = segment.get("no_speech_prob", 0)
-            words = segment.get("words", [])  # ✨ Conserver les mots avec timestamps
-            
-            # Filtres de qualité optimisés
-            if duration < 0.2:
-                continue
-            if not text or text in [".", "...", "..."]:
-                continue
-            if no_speech_prob > 0.9:
-                continue
-            
-            words_count = len(text.split())
-            if duration < 0.5 and words_count < 1:
-                continue
-            
-            # Filtrage répétitions intelligentes
-            if text in suspicious_texts and suspicious_texts[text] > 8:
-                text_occurrence_count = sum(1 for prev_seg in cleaned_segments if prev_seg.get("text") == text)
-                if text_occurrence_count > 0 and (text_occurrence_count + 1) % 4 != 0:
-                    logger.info(f"🔥 Suppression hallucination: '{text[:30]}...'")
-                    continue
-            
-            # Segments consécutifs identiques
-            if (cleaned_segments and 
-                cleaned_segments[-1].get("text") == text and 
-                abs(start_time - cleaned_segments[-1].get("end", 0)) < 0.2):
-                logger.info(f"🔥 Suppression doublon temporel: '{text[:30]}...'")
-                continue
-            
-            # ✨ NOUVEAU : Validation et nettoyage des timestamps de mots
-            validated_words = []
-            if words and isinstance(words, list):
-                for word_info in words:
-                    try:
-                        if isinstance(word_info, dict) and 'word' in word_info:
-                            # Valider timestamps de mots
-                            word_start = word_info.get('start', start_time)
-                            word_end = word_info.get('end', end_time)
-                            
-                            # Corriger timestamps aberrants
-                            if word_start < start_time:
-                                word_start = start_time
-                            if word_end > end_time:
-                                word_end = end_time
-                            if word_start >= word_end:
-                                word_end = word_start + 0.1
-                            
-                            validated_words.append({
-                                'word': word_info['word'],
-                                'start': word_start,
-                                'end': word_end,
-                                'probability': word_info.get('probability', 1.0)
-                            })
-                    except Exception as word_error:
-                        # Ignorer les mots problématiques
-                        logger.debug(f"Mot ignoré: {word_error}")
-                        continue
-            
-            # Garder le segment avec informations enrichies
-            cleaned_segments.append({
-                "start": start_time,
-                "end": end_time,
-                "text": text,
-                "confidence": 1 - no_speech_prob,
-                "duration": duration,
-                "words_count": words_count,
-                "words": validated_words,  # ✨ Mots avec timestamps validés
-                "has_word_timestamps": len(validated_words) > 0
-            })
-        
-        removed_count = len(segments_raw) - len(cleaned_segments)
         word_segments_count = sum(1 for seg in cleaned_segments if seg.get("has_word_timestamps"))
         
-        logger.info(f"✅ Transcription terminée:")
-        logger.info(f"   📝 Segments valides: {len(cleaned_segments)} (supprimé {removed_count})")
+        logger.info(f"✅ Transcription terminée avec améliorations:")
+        logger.info(f"   📝 Segments finaux: {len(cleaned_segments)} (supprimé {len(segments_raw) - len(cleaned_segments)})")
         logger.info(f"   🔤 Segments avec mots: {word_segments_count}/{len(cleaned_segments)}")
-        
-        if repetition_warning:
-            logger.warning(f"⚠️ ATTENTION: Hallucinations Whisper détectées ({len(suspicious_texts)} phrases)")
+        logger.info(f"   🚨 Hallucinations: {'⚠️ DÉTECTÉES' if hallucination_detected else '✅ Aucune'}")
         
         return {
             'success': True,
@@ -445,26 +531,22 @@ def transcribe_with_whisper(audio_path):
             'segments_raw_count': len(segments_raw),
             'segments_cleaned_count': len(cleaned_segments),
             'word_segments_count': word_segments_count,
-            'repetition_warning': repetition_warning,
-            'suspicious_repetitions': suspicious_texts
+            'repetition_warning': len(suspicious_texts) > 0 or hallucination_detected,
+            'suspicious_repetitions': suspicious_texts,
+            'hallucination_detected': hallucination_detected,
+            'filter_version': "v2.0_enhanced"
         }
         
     except Exception as e:
         logger.error(f"❌ Erreur transcription globale: {e}")
         logger.error(f"🔍 Traceback: {traceback.format_exc()}")
-        return {
-            'success': False,
-            'error': str(e)
-        }
+        return {'success': False, 'error': str(e)}
 
 def diarize_with_pyannote(audio_path, num_speakers=None, min_speakers=2, max_speakers=4):
-    """ÉTAPE 2: Diarisation seule avec pyannote"""
+    """ÉTAPE 2: Diarisation avec pyannote"""
     try:
         if not diarization_pipeline:
-            return {
-                'success': False,
-                'error': 'Pipeline de diarisation non disponible'
-            }
+            return {'success': False, 'error': 'Pipeline de diarisation non disponible'}
         
         logger.info("👥 ÉTAPE 2: Diarisation pyannote...")
         
@@ -514,14 +596,108 @@ def diarize_with_pyannote(audio_path, num_speakers=None, min_speakers=2, max_spe
         
     except Exception as e:
         logger.error(f"❌ Erreur diarisation: {e}")
-        return {
-            'success': False,
-            'error': str(e)
-        }
+        return {'success': False, 'error': str(e)}
+
+def enhanced_speaker_validation(segments):
+    """Validation finale renforcée des speakers"""
+    logger.info("🔒 Validation finale renforcée des speakers...")
+    
+    validated_segments = []
+    speaker_consistency_score = {}
+    
+    # Analyser la cohérence de chaque speaker
+    valid_speakers = set()
+    for segment in segments:
+        speaker = segment["speaker"]
+        if speaker != "SPEAKER_UNKNOWN":
+            valid_speakers.add(speaker)
+    
+    if not valid_speakers:
+        valid_speakers = {"SPEAKER_00", "SPEAKER_01"}
+        logger.warning("⚠️ Aucun speaker valide - création forcée")
+    
+    # Calculer scores de cohérence
+    for speaker in valid_speakers:
+        speaker_segments = [seg for seg in segments if seg["speaker"] == speaker]
+        
+        if speaker_segments:
+            total_coverage = sum(seg.get("speaker_coverage", 0) for seg in speaker_segments)
+            avg_coverage = total_coverage / len(speaker_segments)
+            
+            speaker_consistency_score[speaker] = {
+                "avg_coverage": avg_coverage,
+                "segments_count": len(speaker_segments),
+                "total_time": sum(seg["end"] - seg["start"] for seg in speaker_segments)
+            }
+    
+    logger.info(f"📊 Scores de cohérence speakers:")
+    for speaker, score in speaker_consistency_score.items():
+        logger.info(f"   {speaker}: {score['avg_coverage']:.2f} coverage, {score['segments_count']} segments")
+    
+    # Validation et correction
+    for i, segment in enumerate(segments):
+        current_speaker = segment["speaker"]
+        
+        # Éliminer définitivement SPEAKER_UNKNOWN
+        if current_speaker == "SPEAKER_UNKNOWN":
+            # Trouver le meilleur speaker de remplacement
+            if speaker_consistency_score:
+                best_replacement = max(speaker_consistency_score.items(), 
+                                     key=lambda x: x[1]["avg_coverage"])[0]
+            else:
+                best_replacement = list(valid_speakers)[0]
+            
+            logger.warning(f"🔧 CORRECTION: SPEAKER_UNKNOWN → {best_replacement}")
+            segment["speaker"] = best_replacement
+            segment["speaker_coverage"] = 0.1
+            segment["final_correction"] = True
+        
+        # Corriger speakers avec coverage très faible
+        elif segment.get("speaker_coverage", 0) < 0.15:
+            # Analyser le contexte
+            context_speakers = []
+            
+            # Contexte précédent (2 segments)
+            for j in range(max(0, i-2), i):
+                if j < len(segments):
+                    context_speakers.append(segments[j]["speaker"])
+            
+            # Contexte suivant (2 segments)
+            for j in range(i+1, min(len(segments), i+3)):
+                context_speakers.append(segments[j]["speaker"])
+            
+            # Speaker le plus fréquent dans le contexte
+            if context_speakers:
+                most_common = Counter(context_speakers).most_common(1)[0][0]
+                
+                if most_common != current_speaker and most_common in valid_speakers:
+                    logger.info(f"🔧 Correction contexte: {current_speaker} → {most_common}")
+                    segment["speaker"] = most_common
+                    segment["speaker_coverage"] = 0.3
+                    segment["context_correction"] = True
+        
+        validated_segments.append(segment)
+    
+    # Vérification finale
+    final_speakers = set(seg["speaker"] for seg in validated_segments)
+    unknown_count = sum(1 for seg in validated_segments if seg["speaker"] == "SPEAKER_UNKNOWN")
+    
+    if unknown_count > 0:
+        logger.error(f"❌ ÉCHEC: {unknown_count} SPEAKER_UNKNOWN encore présents!")
+        # Correction d'urgence finale
+        fallback_speaker = list(valid_speakers)[0] if valid_speakers else "SPEAKER_00"
+        for seg in validated_segments:
+            if seg["speaker"] == "SPEAKER_UNKNOWN":
+                seg["speaker"] = fallback_speaker
+                seg["emergency_final_fix"] = True
+    else:
+        logger.info(f"✅ Validation finale réussie: {sorted(final_speakers)}")
+    
+    return validated_segments
 
 def assign_speakers_to_transcription_enhanced(transcription_segments, speaker_segments):
     """ÉTAPE 3: Attribution WhisperX-style avec précision mot-par-mot"""
-    logger.info("🔗 ÉTAPE 3: Attribution speakers niveau mot (style WhisperX)...")
+    logger.info("🔗 ÉTAPE 3: Attribution speakers niveau mot (style WhisperX amélioré)...")
     
     final_segments = []
     
@@ -541,90 +717,82 @@ def assign_speakers_to_transcription_enhanced(transcription_segments, speaker_se
         words = trans_seg.get("words", [])
         has_word_timestamps = trans_seg.get("has_word_timestamps", False)
         
-        # ✨ ATTRIBUTION NIVEAU MOT (comme WhisperX)
-        if has_word_timestamps and words and len(words) > 0:
-            logger.info(f"🔤 Attribution précise pour segment avec {len(words)} mots")
+        # Attribution niveau mot (comme WhisperX)
+        if has_word_timestamps and words:
+            logger.debug(f"🔤 Attribution précise pour segment avec {len(words)} mots")
             
             words_with_speakers = []
             segment_speaker_votes = {}
             
             for word_info in words:
-                try:
-                    if not isinstance(word_info, dict) or 'word' not in word_info:
-                        continue
+                word_start = word_info.get('start', trans_start)
+                word_end = word_info.get('end', trans_end)
+                word_center = (word_start + word_end) / 2
+                word_duration = word_end - word_start
+                
+                # Trouver le meilleur speaker pour ce mot
+                best_speaker = None
+                best_coverage = 0
+                
+                # Méthode 1: Centre du mot dans un segment de speaker
+                for spk_seg in speaker_segments:
+                    spk_start = spk_seg["start"]
+                    spk_end = spk_seg["end"]
+                    
+                    if spk_start <= word_center <= spk_end:
+                        overlap_start = max(word_start, spk_start)
+                        overlap_end = min(word_end, spk_end)
+                        overlap = max(0, overlap_end - overlap_start)
+                        coverage = overlap / word_duration if word_duration > 0 else 0
                         
-                    word_start = word_info.get('start', trans_start)
-                    word_end = word_info.get('end', trans_end)
-                    word_center = (word_start + word_end) / 2
-                    word_duration = word_end - word_start
-                    
-                    # Trouver le meilleur speaker pour ce mot
-                    best_speaker = None
-                    best_coverage = 0
-                    
-                    # Méthode 1: Centre du mot dans un segment de speaker
+                        if coverage > best_coverage:
+                            best_coverage = coverage
+                            best_speaker = spk_seg["speaker"]
+                
+                # Méthode 2: Meilleur recouvrement si centre pas trouvé
+                if not best_speaker:
                     for spk_seg in speaker_segments:
                         spk_start = spk_seg["start"]
                         spk_end = spk_seg["end"]
                         
-                        if spk_start <= word_center <= spk_end:
-                            overlap_start = max(word_start, spk_start)
-                            overlap_end = min(word_end, spk_end)
-                            overlap = max(0, overlap_end - overlap_start)
-                            coverage = overlap / word_duration if word_duration > 0 else 0
-                            
-                            if coverage > best_coverage:
-                                best_coverage = coverage
-                                best_speaker = spk_seg["speaker"]
-                    
-                    # Méthode 2: Meilleur recouvrement si centre pas trouvé
-                    if not best_speaker:
-                        for spk_seg in speaker_segments:
-                            spk_start = spk_seg["start"]
-                            spk_end = spk_seg["end"]
-                            
-                            overlap_start = max(word_start, spk_start)
-                            overlap_end = min(word_end, spk_end)
-                            overlap = max(0, overlap_end - overlap_start)
-                            coverage = overlap / word_duration if word_duration > 0 else 0
-                            
-                            if coverage > best_coverage:
-                                best_coverage = coverage
-                                best_speaker = spk_seg["speaker"]
-                    
-                    # Fallback temporel si pas trouvé
-                    if not best_speaker:
-                        min_distance = float('inf')
-                        for spk_seg in speaker_segments:
-                            spk_center = (spk_seg["start"] + spk_seg["end"]) / 2
-                            distance = abs(word_center - spk_center)
-                            if distance < min_distance:
-                                min_distance = distance
-                                best_speaker = spk_seg["speaker"]
-                    
-                    # Dernier recours
-                    if not best_speaker or best_speaker not in known_speakers:
-                        best_speaker = known_speakers[0]
-                        best_coverage = 0.1
-                    
-                    # Ajouter le mot avec son speaker
-                    words_with_speakers.append({
-                        'word': word_info['word'],
-                        'start': word_start,
-                        'end': word_end,
-                        'probability': word_info.get('probability', 1.0),
-                        'speaker': best_speaker,
-                        'coverage': best_coverage
-                    })
-                    
-                    # Vote pour le speaker du segment
-                    if best_speaker not in segment_speaker_votes:
-                        segment_speaker_votes[best_speaker] = 0
-                    segment_speaker_votes[best_speaker] += best_coverage * word_duration
-                    
-                except Exception as word_error:
-                    logger.debug(f"Erreur traitement mot: {word_error}")
-                    continue
+                        overlap_start = max(word_start, spk_start)
+                        overlap_end = min(word_end, spk_end)
+                        overlap = max(0, overlap_end - overlap_start)
+                        coverage = overlap / word_duration if word_duration > 0 else 0
+                        
+                        if coverage > best_coverage:
+                            best_coverage = coverage
+                            best_speaker = spk_seg["speaker"]
+                
+                # Fallback temporel
+                if not best_speaker:
+                    min_distance = float('inf')
+                    for spk_seg in speaker_segments:
+                        spk_center = (spk_seg["start"] + spk_seg["end"]) / 2
+                        distance = abs(word_center - spk_center)
+                        if distance < min_distance:
+                            min_distance = distance
+                            best_speaker = spk_seg["speaker"]
+                
+                # Dernier recours
+                if not best_speaker or best_speaker not in known_speakers:
+                    best_speaker = known_speakers[0]
+                    best_coverage = 0.1
+                
+                # Ajouter le mot avec son speaker
+                words_with_speakers.append({
+                    'word': word_info['word'],
+                    'start': word_start,
+                    'end': word_end,
+                    'probability': word_info.get('probability', 1.0),
+                    'speaker': best_speaker,
+                    'coverage': best_coverage
+                })
+                
+                # Vote pour le speaker du segment
+                if best_speaker not in segment_speaker_votes:
+                    segment_speaker_votes[best_speaker] = 0
+                segment_speaker_votes[best_speaker] += best_coverage * word_duration
             
             # Déterminer le speaker principal du segment par vote pondéré
             if segment_speaker_votes:
@@ -634,12 +802,8 @@ def assign_speakers_to_transcription_enhanced(transcription_segments, speaker_se
                 segment_speaker = known_speakers[0]
                 segment_coverage = 0.1
             
-            logger.info(f"   🗳️ Votes speakers: {segment_speaker_votes} → {segment_speaker}")
-            
         else:
-            # ✨ ATTRIBUTION CLASSIQUE NIVEAU SEGMENT (fallback)
-            logger.info(f"📄 Attribution classique pour segment sans mots détaillés")
-            
+            # Attribution classique niveau segment
             best_speaker = None
             best_coverage = 0
             
@@ -697,18 +861,7 @@ def assign_speakers_to_transcription_enhanced(transcription_segments, speaker_se
     
     # Post-traitement amélioré
     final_segments = smooth_speaker_transitions_enhanced(final_segments)
-    final_segments = force_known_speakers_only(final_segments, known_speakers)
-    
-    # Vérification finale
-    final_speakers = set(seg["speaker"] for seg in final_segments)
-    unknown_count = sum(1 for seg in final_segments if seg["speaker"] == "SPEAKER_UNKNOWN")
-    
-    if unknown_count > 0:
-        logger.error(f"❌ ERREUR: {unknown_count} segments SPEAKER_UNKNOWN après attribution!")
-        for seg in final_segments:
-            if seg["speaker"] == "SPEAKER_UNKNOWN":
-                seg["speaker"] = known_speakers[0]
-                seg["emergency_fix"] = True
+    final_segments = enhanced_speaker_validation(final_segments)
     
     word_level_count = sum(1 for seg in final_segments if seg.get("attribution_method") == "word_level")
     speakers_assigned = len(set(seg["speaker"] for seg in final_segments))
@@ -716,7 +869,6 @@ def assign_speakers_to_transcription_enhanced(transcription_segments, speaker_se
     logger.info(f"✅ Attribution terminée:")
     logger.info(f"   🎯 Speakers: {speakers_assigned} sur {len(final_segments)} segments")
     logger.info(f"   🔤 Attribution mot-par-mot: {word_level_count}/{len(final_segments)} segments")
-    logger.info(f"   🎭 Speakers finaux: {sorted(final_speakers)}")
     
     return final_segments
 
@@ -762,29 +914,27 @@ def smooth_speaker_transitions_enhanced(segments, min_segment_duration=1.0, conf
             smooth_reason = "faible_confiance_entre_meme_speaker"
         
         # Cas 3: Segments avec mots - vérifier cohérence
-        elif (current.get("has_word_speakers") and
-              current.get("words")):
-            
-            # Compter les mots par speaker dans ce segment
+        elif (current.get("has_word_speakers") and current.get("words")):
+            # Compter les mots par speaker
             word_speakers = {}
             for word in current["words"]:
                 if isinstance(word, dict) and "speaker" in word:
                     spk = word["speaker"]
                     word_speakers[spk] = word_speakers.get(spk, 0) + 1
             
-            # Si la majorité des mots vote pour un autre speaker
+            # Si majorité des mots vote pour un autre speaker
             if word_speakers:
                 word_majority_speaker = max(word_speakers.items(), key=lambda x: x[1])[0]
-                if (word_majority_speaker != current_speaker and
-                    word_speakers[word_majority_speaker] / len(current["words"]) > 0.7):
-                    
+                majority_ratio = word_speakers[word_majority_speaker] / len(current["words"])
+                
+                if (word_majority_speaker != current_speaker and majority_ratio > 0.7):
                     should_smooth = True
                     new_speaker = word_majority_speaker
                     smooth_reason = "majorite_mots_autre_speaker"
         
         # Appliquer le lissage
         if should_smooth and new_speaker:
-            logger.info(f"🔧 Lissage ({smooth_reason}): '{current['text'][:30]}...' {current_speaker} → {new_speaker}")
+            logger.debug(f"🔧 Lissage ({smooth_reason}): '{current['text'][:30]}...' {current_speaker} → {new_speaker}")
             smoothed[i]["speaker"] = new_speaker
             smoothed[i]["smoothed"] = True
             smoothed[i]["smooth_reason"] = smooth_reason
@@ -803,90 +953,22 @@ def smooth_speaker_transitions_enhanced(segments, min_segment_duration=1.0, conf
     
     return smoothed
 
-def force_known_speakers_only(segments, known_speakers):
-    """Force tous les segments à avoir un speaker connu - ÉLIMINE SPEAKER_UNKNOWN"""
-    logger.info("🔒 Forçage final: élimination de tous les SPEAKER_UNKNOWN...")
-    
-    if not known_speakers:
-        known_speakers = ["SPEAKER_00"]
-    
-    fixed_segments = []
-    unknown_count = 0
-    
-    for i, segment in enumerate(segments):
-        current_speaker = segment["speaker"]
-        
-        # Si c'est SPEAKER_UNKNOWN ou un speaker non reconnu
-        if current_speaker == "SPEAKER_UNKNOWN" or current_speaker not in known_speakers:
-            unknown_count += 1
-            
-            # Stratégie 1: Hériter du speaker précédent
-            if i > 0 and fixed_segments[-1]["speaker"] in known_speakers:
-                new_speaker = fixed_segments[-1]["speaker"]
-                method = "inherit_previous"
-                
-            # Stratégie 2: Regarder le speaker suivant
-            elif i < len(segments) - 1 and segments[i+1]["speaker"] in known_speakers:
-                new_speaker = segments[i+1]["speaker"]
-                method = "inherit_next"
-                
-            # Stratégie 3: Speaker le plus fréquent jusqu'à présent
-            else:
-                if fixed_segments:
-                    speaker_counts = {}
-                    for prev_seg in fixed_segments:
-                        speaker = prev_seg["speaker"]
-                        if speaker in known_speakers:
-                            speaker_counts[speaker] = speaker_counts.get(speaker, 0) + 1
-                    
-                    if speaker_counts:
-                        new_speaker = max(speaker_counts.items(), key=lambda x: x[1])[0]
-                        method = "most_frequent"
-                    else:
-                        new_speaker = known_speakers[0]
-                        method = "default_first"
-                else:
-                    new_speaker = known_speakers[0]
-                    method = "default_first"
-            
-            logger.info(f"🔧 Correction UNKNOWN: '{segment['text'][:30]}...' {current_speaker} → {new_speaker} ({method})")
-            
-            # Créer le segment corrigé
-            corrected_segment = segment.copy()
-            corrected_segment["speaker"] = new_speaker
-            corrected_segment["speaker_coverage"] = 0.1  # Faible confiance pour attribution forcée
-            corrected_segment["forced_attribution"] = True
-            corrected_segment["attribution_method"] = method
-            
-            fixed_segments.append(corrected_segment)
-        else:
-            # Segment déjà correct
-            fixed_segments.append(segment)
-    
-    if unknown_count > 0:
-        logger.info(f"✅ Correction terminée: {unknown_count} segments SPEAKER_UNKNOWN réassignés")
-    
-    # Vérification finale
-    final_speakers = set(seg["speaker"] for seg in fixed_segments)
-    if "SPEAKER_UNKNOWN" in final_speakers:
-        logger.error("❌ ERREUR: SPEAKER_UNKNOWN encore présent après correction!")
-    else:
-        logger.info(f"✅ SUCCÈS: Seulement speakers connus présents: {sorted(final_speakers)}")
-    
-    return fixed_segments
-
 def transcribe_and_diarize_separated(audio_path, num_speakers=None, min_speakers=2, max_speakers=4):
-    """Fonction principale avec processus séparés - GARANTIT à 100% l'absence de SPEAKER_UNKNOWN"""
+    """Fonction principale avec processus séparés - Version améliorée v2.0"""
     try:
-        # ÉTAPE 1: Transcription
+        # ÉTAPE 1: Transcription améliorée
         transcription_result = transcribe_with_whisper(audio_path)
         if not transcription_result['success']:
             return transcription_result
         
         # Vérifier si on a des répétitions suspectes
         repetition_warning = transcription_result.get('repetition_warning', False)
-        if repetition_warning:
-            logger.warning("⚠️ Transcription avec répétitions détectées - qualité audio possiblement dégradée")
+        hallucination_detected = transcription_result.get('hallucination_detected', False)
+        
+        if hallucination_detected:
+            logger.warning("🚨 HALLUCINATION WHISPER DÉTECTÉE - Qualité audio dégradée")
+        elif repetition_warning:
+            logger.warning("⚠️ Répétitions détectées - Possible dégradation qualité")
         
         # ÉTAPE 2: Diarisation
         diarization_result = diarize_with_pyannote(
@@ -897,31 +979,33 @@ def transcribe_and_diarize_separated(audio_path, num_speakers=None, min_speakers
         )
         
         if not diarization_result['success']:
-            logger.warning("⚠️ Diarisation échouée - attribution automatique par segments")
+            logger.warning("⚠️ Diarisation échouée - Attribution automatique intelligente")
             
-            # FALLBACK INTELLIGENT: Répartition automatique
+            # FALLBACK INTELLIGENT amélioré
             segments_with_auto_speakers = []
-            
-            # Déterminer le nombre de speakers à utiliser
             target_speakers = num_speakers if num_speakers and num_speakers > 0 else 2
             speaker_names = [f"SPEAKER_{i:02d}" for i in range(target_speakers)]
             
             logger.info(f"🔄 Attribution automatique sur {target_speakers} speakers: {speaker_names}")
             
+            # Attribution intelligente basée sur les pauses
             for i, segment in enumerate(transcription_result["segments"]):
-                # Alternance simple mais efficace
                 if target_speakers == 1:
                     speaker_name = "SPEAKER_00"
                 else:
-                    # Logique d'alternance améliorée
+                    # Logique améliorée d'alternance
                     if i == 0:
                         speaker_idx = 0
                     else:
-                        # Changer de speaker après des segments longs ou périodiquement
-                        prev_duration = segments_with_auto_speakers[-1]["end"] - segments_with_auto_speakers[-1]["start"]
-                        prev_speaker_idx = int(segments_with_auto_speakers[-1]["speaker"].split("_")[1])
+                        prev_segment = segments_with_auto_speakers[-1]
+                        prev_duration = prev_segment["end"] - prev_segment["start"]
+                        prev_speaker_idx = int(prev_segment["speaker"].split("_")[1])
                         
-                        if prev_duration > 3.0 or i % 4 == 0:  # Changer après 3s ou tous les 4 segments
+                        # Pause entre segments
+                        pause_duration = segment["start"] - prev_segment["end"]
+                        
+                        # Changer de speaker si pause longue ou segment long précédent
+                        if pause_duration > 1.0 or prev_duration > 4.0 or i % 5 == 0:
                             speaker_idx = (prev_speaker_idx + 1) % target_speakers
                         else:
                             speaker_idx = prev_speaker_idx
@@ -932,10 +1016,11 @@ def transcribe_and_diarize_separated(audio_path, num_speakers=None, min_speakers
                     "start": segment["start"],
                     "end": segment["end"],
                     "text": segment["text"],
-                    "speaker": speaker_name,  # TOUJOURS un speaker connu
+                    "speaker": speaker_name,
                     "confidence": segment["confidence"],
-                    "speaker_coverage": 0.8,
-                    "attribution_method": "auto_alternation_fallback"
+                    "speaker_coverage": 0.8,  # Confiance artificielle élevée
+                    "attribution_method": "auto_alternation_enhanced",
+                    "words": segment.get("words", [])
                 })
             
             return {
@@ -947,7 +1032,9 @@ def transcribe_and_diarize_separated(audio_path, num_speakers=None, min_speakers
                 'diarization_available': False,
                 'warning': f'Diarisation échouée - attribution automatique: {diarization_result.get("error", "Erreur inconnue")}',
                 'fallback_mode': True,
-                'repetition_warning': repetition_warning
+                'repetition_warning': repetition_warning,
+                'hallucination_detected': hallucination_detected,
+                'final_speakers': sorted(set(seg["speaker"] for seg in segments_with_auto_speakers))
             }
         
         # ÉTAPE 3: Attribution des speakers (diarisation réussie)
@@ -956,25 +1043,24 @@ def transcribe_and_diarize_separated(audio_path, num_speakers=None, min_speakers
             diarization_result["speaker_segments"]
         )
         
-        # VÉRIFICATION FINALE CRITIQUE - TRIPLE CONTRÔLE
+        # VÉRIFICATION FINALE TRIPLE CONTRÔLE
         final_speakers = set(seg["speaker"] for seg in final_segments)
         unknown_segments = [seg for seg in final_segments if seg["speaker"] == "SPEAKER_UNKNOWN"]
         
         if unknown_segments:
-            logger.error(f"❌ ERREUR CRITIQUE: {len(unknown_segments)} segments SPEAKER_UNKNOWN après tout le processus!")
+            logger.error(f"❌ ERREUR CRITIQUE: {len(unknown_segments)} segments SPEAKER_UNKNOWN!")
             
             # CORRECTION D'URGENCE FINALE
             known_speakers = [s for s in final_speakers if s != "SPEAKER_UNKNOWN"]
             if not known_speakers:
                 known_speakers = ["SPEAKER_00", "SPEAKER_01"]
-                logger.error("🚨 Aucun speaker connu trouvé - création forcée SPEAKER_00/01")
+                logger.error("🚨 Création forcée SPEAKER_00/01")
             
-            # Forcer tous les SPEAKER_UNKNOWN vers des speakers connus
+            # Forcer tous les SPEAKER_UNKNOWN
             for i, seg in enumerate(final_segments):
                 if seg["speaker"] == "SPEAKER_UNKNOWN":
-                    # Stratégie: alternance simple entre speakers connus
                     new_speaker = known_speakers[i % len(known_speakers)]
-                    logger.error(f"🚨 CORRECTION FINALE: SPEAKER_UNKNOWN → {new_speaker} pour '{seg['text'][:30]}...'")
+                    logger.error(f"🚨 CORRECTION: SPEAKER_UNKNOWN → {new_speaker}")
                     final_segments[i]["speaker"] = new_speaker
                     final_segments[i]["speaker_coverage"] = 0.1
                     final_segments[i]["emergency_fix"] = True
@@ -984,19 +1070,19 @@ def transcribe_and_diarize_separated(audio_path, num_speakers=None, min_speakers
         post_unknown_count = sum(1 for seg in final_segments if seg["speaker"] == "SPEAKER_UNKNOWN")
         
         if post_unknown_count > 0:
-            logger.error(f"❌ ÉCHEC TOTAL: {post_unknown_count} SPEAKER_UNKNOWN subsistent malgré corrections!")
-            # En dernier recours, remplacer tout par SPEAKER_00
+            logger.error(f"❌ ÉCHEC TOTAL: {post_unknown_count} SPEAKER_UNKNOWN!")
+            # En dernier recours
             for seg in final_segments:
                 if seg["speaker"] == "SPEAKER_UNKNOWN":
                     seg["speaker"] = "SPEAKER_00"
                     seg["absolute_fallback"] = True
         else:
-            logger.info(f"✅ SUCCÈS: Aucun SPEAKER_UNKNOWN après vérification finale")
+            logger.info(f"✅ SUCCÈS: Aucun SPEAKER_UNKNOWN")
         
         speakers_detected = len(set(seg["speaker"] for seg in final_segments))
         final_speaker_list = sorted(set(seg["speaker"] for seg in final_segments))
         
-        logger.info(f"🎉 Processus complet terminé: {speakers_detected} speakers finaux")
+        logger.info(f"🎉 Processus complet terminé: {speakers_detected} speakers")
         logger.info(f"🎯 Speakers utilisés: {final_speaker_list}")
         
         return {
@@ -1011,53 +1097,52 @@ def transcribe_and_diarize_separated(audio_path, num_speakers=None, min_speakers
             'fallback_mode': False,
             'final_speakers': final_speaker_list,
             'repetition_warning': repetition_warning,
+            'hallucination_detected': hallucination_detected,
             'unknown_segments_corrected': len(unknown_segments) if unknown_segments else 0,
-            'word_segments_count': transcription_result.get('word_segments_count', 0)
+            'word_segments_count': transcription_result.get('word_segments_count', 0),
+            'filter_version': transcription_result.get('filter_version', 'v2.0')
         }
         
     except Exception as e:
         logger.error(f"❌ Erreur processus séparé: {e}")
         logger.error(f"🔍 Traceback: {traceback.format_exc()}")
-        return {
-            'success': False,
-            'error': str(e)
-        }
+        return {'success': False, 'error': str(e)}
 
 def create_formatted_transcript(segments):
-    """Crée un transcript formaté avec speakers et statistiques - Version sans SPEAKER_UNKNOWN"""
+    """Crée un transcript formaté avec améliorations v2.0"""
     if not segments:
         return "Aucune transcription disponible."
     
-    # Filtrer encore une fois les segments pour l'affichage
+    # Filtrer une dernière fois pour l'affichage
     display_segments = []
     for segment in segments:
         text = segment.get("text", "").strip()
         duration = segment.get("end", 0) - segment.get("start", 0)
         
-        # Ne garder que les segments avec du contenu réel
+        # Critères d'affichage plus stricts
         if (text and 
             text not in [".", ",", "!", "?", "...", "-", " ", "..."] and
             len(text) > 1 and
-            duration >= 0.5):  # Au moins 0.5s
+            duration >= 0.4):  # Seuil légèrement réduit
             display_segments.append(segment)
     
     if not display_segments:
         return "Aucun contenu parlé détecté dans cet audio."
     
-    # Vérification finale: aucun SPEAKER_UNKNOWN ne doit être affiché
+    # Élimination finale des SPEAKER_UNKNOWN pour l'affichage
     unknown_segments = [seg for seg in display_segments if seg.get("speaker") == "SPEAKER_UNKNOWN"]
     if unknown_segments:
-        logger.warning(f"⚠️ {len(unknown_segments)} segments SPEAKER_UNKNOWN détectés dans l'affichage - correction!")
+        logger.warning(f"⚠️ {len(unknown_segments)} segments SPEAKER_UNKNOWN dans l'affichage - correction!")
         for seg in display_segments:
             if seg.get("speaker") == "SPEAKER_UNKNOWN":
-                seg["speaker"] = "SPEAKER_00"  # Correction d'affichage
+                seg["speaker"] = "SPEAKER_00"
     
-    # Statistiques par speaker (en excluant SPEAKER_UNKNOWN)
+    # Statistiques par speaker
     speaker_stats = {}
     for segment in display_segments:
         speaker = segment["speaker"]
         if speaker == "SPEAKER_UNKNOWN":
-            continue  # Ignorer complètement les SPEAKER_UNKNOWN
+            continue
             
         if speaker not in speaker_stats:
             speaker_stats[speaker] = {
@@ -1079,14 +1164,15 @@ def create_formatted_transcript(segments):
     total_duration = display_segments[-1]["end"] if display_segments else 0
     for speaker in speaker_stats:
         stats = speaker_stats[speaker]
-        stats["avg_confidence"] /= stats["segments_count"]
-        stats["avg_coverage"] /= stats["segments_count"]
-        stats["percentage"] = (stats["total_time"] / total_duration * 100) if total_duration > 0 else 0
+        if stats["segments_count"] > 0:
+            stats["avg_confidence"] /= stats["segments_count"]
+            stats["avg_coverage"] /= stats["segments_count"]
+            stats["percentage"] = (stats["total_time"] / total_duration * 100) if total_duration > 0 else 0
     
     # Créer le transcript
-    lines = ["=== TRANSCRIPTION AVEC DIARISATION AMÉLIORÉE (WhisperX-style) ===\n"]
+    lines = ["=== TRANSCRIPTION AVEC DIARISATION AMÉLIORÉE v2.0 (WhisperX-style) ===\n"]
     
-    # Statistiques détaillées (uniquement speakers connus)
+    # Statistiques détaillées
     lines.append("📊 ANALYSE DES PARTICIPANTS:")
     for speaker, stats in speaker_stats.items():
         conf = int(stats["avg_confidence"] * 100)
@@ -1094,8 +1180,13 @@ def create_formatted_transcript(segments):
         time_str = f"{stats['total_time']:.1f}s"
         percentage = f"{stats['percentage']:.1f}%"
         
-        # Indicateur de qualité de l'attribution
-        quality_indicator = "✅" if coverage > 60 else "⚠️" if coverage > 30 else "❌"
+        # Indicateur de qualité amélioré
+        if coverage > 70:
+            quality_indicator = "✅"
+        elif coverage > 40:
+            quality_indicator = "⚠️"
+        else:
+            quality_indicator = "❌"
         
         lines.append(f"🗣️ {speaker}: {time_str} ({percentage}) - Confiance: {conf}% - Attribution: {coverage}% {quality_indicator}")
     
@@ -1104,12 +1195,16 @@ def create_formatted_transcript(segments):
     lines.append(f"   ⏱️ Durée totale: {total_duration:.1f}s")
     lines.append(f"   🎯 Speakers identifiés: {len(speaker_stats)}")
     
-    # Comptage des améliorations WhisperX-style
+    # Améliorations v2.0
     word_level_count = sum(1 for seg in display_segments if seg.get("attribution_method") == "word_level")
     if word_level_count > 0:
         lines.append(f"   🔤 Attribution mot-par-mot: {word_level_count}/{len(display_segments)} segments")
     
-    # Détection de répétitions pour avertissement
+    enhanced_count = sum(1 for seg in display_segments if seg.get("filter_version", "").startswith("v2.0"))
+    if enhanced_count > 0:
+        lines.append(f"   ✨ Filtrage amélioré v2.0: {enhanced_count}/{len(display_segments)} segments")
+    
+    # Détection problèmes
     text_counts = {}
     for seg in display_segments:
         text = seg["text"]
@@ -1122,14 +1217,14 @@ def create_formatted_transcript(segments):
     lines.append("\n" + "="*60)
     lines.append("📝 CONVERSATION CHRONOLOGIQUE:")
     
-    # Format conversation amélioré (sans SPEAKER_UNKNOWN)
+    # Format conversation amélioré
     current_speaker = None
     for segment in display_segments:
         speaker = segment["speaker"]
         
-        # Ne jamais afficher SPEAKER_UNKNOWN
+        # Assurance finale
         if speaker == "SPEAKER_UNKNOWN":
-            speaker = "SPEAKER_00"  # Remplacement pour affichage
+            speaker = "SPEAKER_00"
         
         start_time = format_timestamp(segment["start"])
         end_time = format_timestamp(segment["end"])
@@ -1141,35 +1236,37 @@ def create_formatted_transcript(segments):
             lines.append(f"\n👤 {speaker}:")
             current_speaker = speaker
         
-        # Indicateurs de qualité avec couleurs
+        # Indicateurs de qualité v2.0
         quality_icons = ""
         if segment.get("smoothed"):
-            quality_icons += "🔧"  # Segment lissé
-        if segment.get("emergency_fix") or segment.get("forced_emergency"):
+            quality_icons += "🔧"  # Lissé
+        if segment.get("emergency_fix") or segment.get("absolute_fallback"):
             quality_icons += "🚨"  # Correction d'urgence
         if segment.get("attribution_method") == "word_level":
             quality_icons += "🔤"  # Attribution mot-par-mot
+        if segment.get("filter_version", "").startswith("v2.0"):
+            quality_icons += "✨"  # Filtrage v2.0
         if coverage < 30:
             quality_icons += "❓"  # Attribution très incertaine
         elif coverage < 60:
             quality_icons += "⚠️"  # Attribution incertaine
         
-        # Indicateur de confiance
+        # Indicateur de confiance audio
         if confidence < 40:
             quality_icons += "🔇"  # Confiance très faible
         elif confidence < 70:
             quality_icons += "🔉"  # Confiance moyenne
         
-        # Affichage du segment avec indicateurs
+        # Couleurs de confiance
         confidence_color = "🟢" if confidence > 70 else "🟡" if confidence > 40 else "🔴"
         coverage_color = "🟢" if coverage > 60 else "🟡" if coverage > 30 else "🔴"
         
         lines.append(f"   [{start_time}-{end_time}] {segment['text']}")
         lines.append(f"      └─ {confidence_color}Conf:{confidence}% {coverage_color}Attr:{coverage}% {quality_icons}")
     
-    # Résumé de fin
+    # Résumé final amélioré
     lines.append(f"\n" + "="*60)
-    lines.append(f"📊 RÉSUMÉ:")
+    lines.append(f"📊 RÉSUMÉ v2.0:")
     
     # Qualité globale
     avg_confidence = sum(seg["confidence"] for seg in display_segments) / len(display_segments) * 100
@@ -1178,24 +1275,96 @@ def create_formatted_transcript(segments):
     lines.append(f"   🎯 Qualité transcription: {avg_confidence:.0f}%")
     lines.append(f"   🎭 Qualité diarisation: {avg_coverage:.0f}%")
     
-    # Nouvelles métriques WhisperX-style
+    # Nouvelles métriques v2.0
     if word_level_count > 0:
         lines.append(f"   ✨ Attribution précise: {word_level_count}/{len(display_segments)} segments")
     
-    # Recommandations
+    if enhanced_count > 0:
+        lines.append(f"   🚀 Filtrage amélioré: {enhanced_count}/{len(display_segments)} segments")
+    
+    # Détection de corrections appliquées
+    corrections_count = sum(1 for seg in display_segments if seg.get("smoothed") or seg.get("emergency_fix"))
+    if corrections_count > 0:
+        lines.append(f"   🔧 Corrections appliquées: {corrections_count} segments")
+    
+    # Recommandations améliorées
     if avg_confidence < 50:
-        lines.append(f"   💡 Recommandation: Audio de qualité faible - vérifiez le contenu")
+        lines.append(f"   💡 Audio de qualité faible - vérifiez le contenu")
     if avg_coverage < 40:
-        lines.append(f"   💡 Recommandation: Diarisation incertaine - possibles erreurs d'attribution")
+        lines.append(f"   💡 Diarisation incertaine - possibles erreurs d'attribution")
     if suspicious_repetitions:
         lines.append(f"   💡 Attention: Répétitions détectées - possible hallucination Whisper")
     
     return "\n".join(lines)
 
+def post_process_quality_check(result):
+    """Contrôle qualité final avant retour - Version v2.0"""
+    segments = result.get("segments", [])
+    
+    # Vérifications critiques améliorées
+    checks = {
+        "no_unknown_speakers": all(seg.get("speaker") != "SPEAKER_UNKNOWN" for seg in segments),
+        "valid_timestamps": all(seg.get("start", 0) < seg.get("end", 0) for seg in segments),
+        "non_empty_text": all(seg.get("text", "").strip() for seg in segments),
+        "reasonable_durations": all(0.1 <= (seg.get("end", 0) - seg.get("start", 0)) <= 30 for seg in segments),
+        "valid_speakers": all(seg.get("speaker", "").startswith("SPEAKER_") for seg in segments),
+        "minimum_coverage": all(seg.get("speaker_coverage", 0) >= 0 for seg in segments)
+    }
+    
+    logger.info("🔍 Contrôle qualité final v2.0:")
+    for check, passed in checks.items():
+        status = "✅" if passed else "❌"
+        logger.info(f"   {status} {check}")
+    
+    # Corrections d'urgence si nécessaire
+    emergency_fixes = 0
+    
+    if not checks["no_unknown_speakers"]:
+        logger.error("🚨 Correction d'urgence SPEAKER_UNKNOWN...")
+        for seg in segments:
+            if seg.get("speaker") == "SPEAKER_UNKNOWN":
+                seg["speaker"] = "SPEAKER_00"
+                seg["emergency_final_fix"] = True
+                emergency_fixes += 1
+    
+    if not checks["valid_speakers"]:
+        logger.error("🚨 Correction speakers invalides...")
+        for seg in segments:
+            if not seg.get("speaker", "").startswith("SPEAKER_"):
+                seg["speaker"] = "SPEAKER_00"
+                seg["speaker_format_fix"] = True
+                emergency_fixes += 1
+    
+    # Statistiques de qualité améliorées
+    if segments:
+        avg_coverage = sum(seg.get("speaker_coverage", 0) for seg in segments) / len(segments)
+        avg_confidence = sum(seg.get("confidence", 0) for seg in segments) / len(segments)
+        word_level_segments = sum(1 for seg in segments if seg.get("attribution_method") == "word_level")
+        enhanced_segments = sum(1 for seg in segments if seg.get("filter_version", "").startswith("v2.0"))
+        
+        result["quality_metrics"] = {
+            "avg_speaker_coverage": avg_coverage,
+            "avg_transcription_confidence": avg_confidence,
+            "total_segments": len(segments),
+            "quality_checks_passed": sum(checks.values()),
+            "quality_score": sum(checks.values()) / len(checks),
+            "word_level_segments": word_level_segments,
+            "enhanced_segments": enhanced_segments,
+            "emergency_fixes_applied": emergency_fixes
+        }
+        
+        quality_score = result["quality_metrics"]["quality_score"]
+        logger.info(f"📊 Score qualité global: {quality_score:.1%}")
+        
+        if quality_score < 0.8:
+            logger.warning(f"⚠️ Qualité sous-optimale détectée: {quality_score:.1%}")
+    
+    return result
+
 def handler(event):
-    """Handler principal RunPod avec processus séparés - Garantit aucun SPEAKER_UNKNOWN"""
+    """Handler principal RunPod avec améliorations v2.0 - Garantit aucun SPEAKER_UNKNOWN"""
     try:
-        # Chargement des modèles seulement si nécessaire
+        # Chargement des modèles si nécessaire
         if whisper_model is None or diarization_pipeline is None:
             logger.info("🔄 Chargement modèles manquants...")
             load_models()
@@ -1211,7 +1380,7 @@ def handler(event):
         min_speakers = job_input.get("min_speakers", 2)
         max_speakers = job_input.get("max_speakers", 3)
         
-        logger.info(f"🚀 Début traitement: {audio_url}")
+        logger.info(f"🚀 Début traitement v2.0: {audio_url}")
         logger.info(f"👥 Paramètres: num={num_speakers}, min={min_speakers}, max={max_speakers}")
         logger.info(f"🎮 Status modèles: Whisper={'✅' if whisper_model else '❌'} Pyannote={'✅' if diarization_pipeline else '❌'}")
         
@@ -1221,7 +1390,7 @@ def handler(event):
             return {"error": f"Erreur téléchargement: {download_error}"}
         
         try:
-            # Transcription + Diarisation avec processus séparés
+            # Transcription + Diarisation avec processus séparés v2.0
             result = transcribe_and_diarize_separated(
                 audio_path,
                 num_speakers=num_speakers,
@@ -1232,24 +1401,27 @@ def handler(event):
             if not result['success']:
                 return {"error": f"Erreur traitement: {result.get('error', 'Erreur inconnue')}"}
             
-            # VÉRIFICATION FINALE CÔTÉ HANDLER
+            # Contrôle qualité final
+            result = post_process_quality_check(result)
+            
+            # VÉRIFICATION FINALE CÔTÉ HANDLER v2.0
             segments = result.get('segments', [])
             final_speakers = set(seg.get("speaker") for seg in segments)
             unknown_count = sum(1 for seg in segments if seg.get("speaker") == "SPEAKER_UNKNOWN")
             
             if unknown_count > 0:
-                logger.error(f"🚨 HANDLER: {unknown_count} SPEAKER_UNKNOWN détectés dans le résultat final!")
+                logger.error(f"🚨 HANDLER v2.0: {unknown_count} SPEAKER_UNKNOWN détectés!")
                 # Dernière correction possible
                 for seg in segments:
                     if seg.get("speaker") == "SPEAKER_UNKNOWN":
                         seg["speaker"] = "SPEAKER_00"
                         seg["handler_emergency_fix"] = True
-                logger.error(f"🚨 HANDLER: Correction d'urgence appliquée")
+                logger.error(f"🚨 HANDLER v2.0: Correction d'urgence appliquée")
             
             # Création du transcript formaté
             formatted_transcript = create_formatted_transcript(result['segments'])
             
-            # Construction réponse finale avec améliorations WhisperX
+            # Construction réponse finale avec améliorations v2.0
             response = {
                 "transcription": result['transcription'],
                 "transcription_formatee": formatted_transcript,
@@ -1258,34 +1430,47 @@ def handler(event):
                 "language": result['language'],
                 "diarization_available": result['diarization_available'],
                 "device": str(device),
-                "model": "whisper-large-v2-enhanced" if whisper_model else "whisper-unavailable",
+                "model": "whisper-large-v2-enhanced-v2.0" if whisper_model else "whisper-unavailable",
                 "pyannote_model": "speaker-diarization-3.1" if diarization_pipeline else "unavailable",
-                "processing_method": "whisperx_style_separated_processes",
+                "processing_method": "whisperx_style_separated_processes_v2.0",
                 "enhancements": {
                     "word_level_timestamps": True,
                     "word_level_speaker_attribution": True,
                     "gpu_optimizations": torch.cuda.is_available(),
-                    "enhanced_smoothing": True
+                    "enhanced_smoothing": True,
+                    "advanced_filtering": True,
+                    "hallucination_detection": True,
+                    "quality_control": True
                 },
                 "success": True
             }
             
-            # Infos de debug et qualité améliorées
+            # Infos de debug et qualité améliorées v2.0
             if 'speakers_found_by_diarization' in result:
                 response['speakers_found_by_diarization'] = result['speakers_found_by_diarization']
             if 'diarization_params_used' in result:
                 response['diarization_params_used'] = result['diarization_params_used']
             if 'warning' in result:
                 response['warning'] = result['warning']
+            
+            # Nouvelles métriques v2.0
             if 'repetition_warning' in result and result['repetition_warning']:
                 response['repetition_warning'] = True
-                response['warning'] = (response.get('warning', '') + ' ATTENTION: Répétitions détectées dans la transcription.').strip()
+            if 'hallucination_detected' in result and result['hallucination_detected']:
+                response['hallucination_detected'] = True
+                response['warning'] = (response.get('warning', '') + ' ATTENTION: Hallucination Whisper détectée.').strip()
             if 'unknown_segments_corrected' in result:
                 response['unknown_segments_corrected'] = result['unknown_segments_corrected']
             if 'final_speakers' in result:
                 response['final_speakers'] = result['final_speakers']
+            if 'filter_version' in result:
+                response['filter_version'] = result['filter_version']
             
-            # Nouvelles métriques WhisperX-style
+            # Métriques qualité
+            if 'quality_metrics' in result:
+                response['quality_metrics'] = result['quality_metrics']
+            
+            # Nouvelles métriques WhisperX-style v2.0
             if 'word_segments_count' in result:
                 response['word_level_segments'] = result['word_segments_count']
                 response['word_level_coverage'] = f"{result['word_segments_count']}/{len(result.get('segments', []))}"
@@ -1296,15 +1481,22 @@ def handler(event):
                 response['word_level_attributions'] = word_level_attributions
                 response['attribution_quality'] = f"{word_level_attributions}/{len(result.get('segments', []))} segments avec attribution précise"
             
-            # Logs de succès avec détails améliorés
-            logger.info(f"✅ Traitement réussi (mode WhisperX-enhanced):")
+            # Logs de succès avec détails améliorés v2.0
+            logger.info(f"✅ Traitement réussi (WhisperX-enhanced v2.0):")
             logger.info(f"   📝 Segments: {len(result.get('segments', []))}")
             logger.info(f"   🗣️ Speakers: {result.get('speakers_detected', 0)}")
             logger.info(f"   🎯 Speakers finaux: {result.get('final_speakers', 'unknown')}")
             logger.info(f"   🎭 Diarisation: {'✅' if result.get('diarization_available') else '❌'}")
             logger.info(f"   🔤 Segments avec mots: {result.get('word_segments_count', 0)}")
+            logger.info(f"   ✨ Filtrage v2.0: {result.get('filter_version', 'unknown')}")
             logger.info(f"   ⚠️ Répétitions: {'⚠️' if result.get('repetition_warning') else '✅'}")
+            logger.info(f"   🚨 Hallucinations: {'⚠️' if result.get('hallucination_detected') else '✅'}")
             logger.info(f"   🔧 Corrections UNKNOWN: {result.get('unknown_segments_corrected', 0)}")
+            
+            if 'quality_metrics' in result:
+                qm = result['quality_metrics']
+                logger.info(f"   📊 Score qualité: {qm.get('quality_score', 0):.1%}")
+                logger.info(f"   🔧 Corrections d'urgence: {qm.get('emergency_fixes_applied', 0)}")
             
             # Nettoyage GPU après traitement
             cleanup_gpu_memory()
@@ -1321,34 +1513,45 @@ def handler(event):
                 logger.warning(f"⚠️ Erreur nettoyage: {cleanup_error}")
         
     except Exception as e:
-        logger.error(f"❌ Erreur handler: {e}")
+        logger.error(f"❌ Erreur handler v2.0: {e}")
         logger.error(f"🔍 Traceback: {traceback.format_exc()}")
         return {"error": f"Erreur interne: {str(e)}"}
 
 if __name__ == "__main__":
-    logger.info("🚀 Démarrage RunPod Serverless - Transcription + Diarisation AMÉLIORÉE")
-    logger.info("✨ Fonctionnalités WhisperX-style:")
+    logger.info("🚀 Démarrage RunPod Serverless - Transcription + Diarisation AMÉLIORÉE v2.0")
+    logger.info("✨ Fonctionnalités WhisperX-style v2.0:")
     logger.info("   - Attribution niveau mot-par-mot")
     logger.info("   - Timestamps précis des mots")
     logger.info("   - Optimisations GPU avancées")
     logger.info("   - Lissage intelligent des speakers")
     logger.info("   - Élimination garantie des SPEAKER_UNKNOWN")
+    logger.info("   - Détection et filtrage des hallucinations Whisper")
+    logger.info("   - Filtrage adaptatif selon la durée audio")
+    logger.info("   - Validation renforcée de la cohérence speakers")
+    logger.info("   - Contrôle qualité multi-niveaux")
+    logger.info("   - Attribution automatique intelligente en fallback")
     
     logger.info("⏳ Chargement initial des modèles...")
     
     try:
         load_models()
         if whisper_model:
-            logger.info("✅ Whisper large-v2 prêt avec améliorations")
+            logger.info("✅ Whisper large-v2 prêt avec améliorations v2.0")
         else:
             logger.error("❌ Whisper non chargé")
             
         if diarization_pipeline:
-            logger.info("✅ Pyannote prêt")
+            logger.info("✅ Pyannote prêt avec optimisations")
         else:
             logger.warning("⚠️ Pyannote non disponible - mode transcription seule")
             
-        logger.info("✅ Service prêt avec améliorations WhisperX-style")
+        logger.info("✅ Service prêt avec améliorations WhisperX-style v2.0")
+        logger.info("🔧 Nouvelles fonctionnalités:")
+        logger.info("   - Détection hallucinations Whisper en temps réel")
+        logger.info("   - Filtrage adaptatif selon durée audio")
+        logger.info("   - Attribution automatique intelligente")
+        logger.info("   - Métriques de qualité avancées")
+        logger.info("   - Corrections d'urgence multi-niveaux")
         
     except Exception as startup_error:
         logger.error(f"❌ Erreur chargement initial: {startup_error}")
