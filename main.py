@@ -454,7 +454,7 @@ def improved_segment_filtering(segments_raw):
     return cleaned_segments, suspicious_texts, hallucination_detected
 
 def transcribe_with_whisper(audio_path):
-    """ÉTAPE 1: Transcription avec filtrage amélioré"""
+    """ÉTAPE 1: Transcription avec filtrage amélioré - Gestion erreurs version"""
     try:
         logger.info("🎯 ÉTAPE 1: Transcription Whisper large-v2 (mode amélioré v2.0)...")
         
@@ -467,45 +467,142 @@ def transcribe_with_whisper(audio_path):
         if file_size == 0:
             return {'success': False, 'error': 'Fichier audio vide'}
         
-        logger.info("🎯 Lancement transcription avec timestamps de mots...")
+        # STRATÉGIE DE TRANSCRIPTION PROGRESSIVE
+        transcription_attempts = [
+            {
+                "name": "word_timestamps_full",
+                "params": {
+                    "language": 'fr',
+                    "fp16": torch.cuda.is_available(),
+                    "condition_on_previous_text": False,
+                    "no_speech_threshold": 0.6,
+                    "logprob_threshold": -1.0,
+                    "compression_ratio_threshold": 2.0,
+                    "temperature": 0.0,
+                    "verbose": False,
+                    "word_timestamps": True,
+                    "suppress_tokens": [],
+                    "initial_prompt": None
+                }
+            },
+            {
+                "name": "word_timestamps_basic",
+                "params": {
+                    "language": 'fr',
+                    "condition_on_previous_text": False,
+                    "no_speech_threshold": 0.6,
+                    "temperature": 0.0,
+                    "verbose": False,
+                    "word_timestamps": True
+                }
+            },
+            {
+                "name": "standard_optimized",
+                "params": {
+                    "language": 'fr',
+                    "fp16": torch.cuda.is_available(),
+                    "condition_on_previous_text": False,
+                    "no_speech_threshold": 0.6,
+                    "logprob_threshold": -1.0,
+                    "compression_ratio_threshold": 2.0,
+                    "temperature": 0.0,
+                    "verbose": False
+                }
+            },
+            {
+                "name": "minimal_safe",
+                "params": {
+                    "language": 'fr',
+                    "condition_on_previous_text": False,
+                    "temperature": 0.0,
+                    "verbose": False
+                }
+            }
+        ]
         
-        try:
-            # Paramètres optimisés anti-hallucination
-            result = whisper_model.transcribe(
-                audio_path,
-                language='fr',
-                fp16=torch.cuda.is_available(),
-                condition_on_previous_text=False,  # CRITIQUE: Anti-répétitions
-                no_speech_threshold=0.6,
-                logprob_threshold=-1.0,
-                compression_ratio_threshold=2.0,  # Plus strict
-                temperature=0.0,  # Déterministe
-                verbose=False,
-                word_timestamps=True,
-                # NOUVEAUX paramètres anti-hallucination
-                suppress_tokens=[],  # Ne pas supprimer de tokens
-                initial_prompt=None,  # Pas de prompt pour éviter le biais
-            )
-            
-        except Exception as whisper_error:
-            logger.warning(f"⚠️ Erreur avec word_timestamps: {whisper_error}")
-            
-            # Fallback sans word_timestamps
+        result = None
+        successful_method = None
+        
+        for attempt in transcription_attempts:
             try:
-                result = whisper_model.transcribe(
-                    audio_path,
-                    language='fr',
-                    fp16=torch.cuda.is_available(),
-                    condition_on_previous_text=False,
-                    no_speech_threshold=0.6,
-                    logprob_threshold=-1.0,
-                    compression_ratio_threshold=2.0,
-                    temperature=0.0,
-                    verbose=False
-                )
-            except Exception as whisper_error2:
-                logger.error(f"❌ Fallback échoué: {whisper_error2}")
-                return {'success': False, 'error': f'Transcription impossible: {whisper_error2}'}
+                logger.info(f"🔄 Tentative transcription: {attempt['name']}")
+                result = whisper_model.transcribe(audio_path, **attempt['params'])
+                successful_method = attempt['name']
+                logger.info(f"✅ Transcription réussie avec: {successful_method}")
+                break
+                
+            except Exception as whisper_error:
+                error_str = str(whisper_error)
+                
+                # Gestion d'erreurs spécifiques
+                if "Cannot set attribute 'src'" in error_str:
+                    logger.warning(f"⚠️ Erreur version Whisper/Transformers: {attempt['name']}")
+                    logger.info("💡 Cette erreur est due à une incompatibilité de versions")
+                elif "word_timestamps" in error_str:
+                    logger.warning(f"⚠️ word_timestamps non supporté: {attempt['name']}")
+                elif "fp16" in error_str:
+                    logger.warning(f"⚠️ FP16 non supporté: {attempt['name']}")
+                else:
+                    logger.warning(f"⚠️ Erreur inconnue avec {attempt['name']}: {error_str}")
+                
+                # Continuer avec la tentative suivante
+                continue
+        
+        # Si aucune méthode n'a fonctionné
+        if result is None:
+            logger.error("❌ ÉCHEC: Toutes les méthodes de transcription ont échoué")
+            return {
+                'success': False, 
+                'error': 'Transcription impossible avec toutes les méthodes disponibles. Vérifiez la compatibilité Whisper/Transformers.'
+            }
+        
+        logger.info(f"📊 Transcription brute terminée avec {successful_method}:")
+        logger.info(f"   📝 Texte: '{result.get('text', '')[:100]}...'")
+        logger.info(f"   🌍 Langue: {result.get('language', 'unknown')}")
+        logger.info(f"   📈 Segments bruts: {len(result.get('segments', []))}")
+        
+        # Vérifier si on a des timestamps de mots selon la méthode utilisée
+        has_word_timestamps = successful_method in ["word_timestamps_full", "word_timestamps_basic"]
+        if has_word_timestamps:
+            logger.info("✅ Timestamps de mots disponibles")
+        else:
+            logger.info("⚠️ Pas de timestamps de mots - attribution niveau segment uniquement")
+        
+        # NOUVEAU: Filtrage amélioré avec détection hallucinations
+        segments_raw = result.get("segments", [])
+        cleaned_segments, suspicious_texts, hallucination_detected = improved_segment_filtering(segments_raw)
+        
+        # Ajuster les informations de mots selon la méthode de transcription
+        word_segments_count = 0
+        if has_word_timestamps:
+            word_segments_count = sum(1 for seg in cleaned_segments if seg.get("has_word_timestamps"))
+        else:
+            # Pour les méthodes sans word_timestamps, marquer explicitement
+            for seg in cleaned_segments:
+                seg["has_word_timestamps"] = False
+                seg["words"] = []  # Pas de mots détaillés
+        
+        logger.info(f"✅ Transcription terminée avec améliorations:")
+        logger.info(f"   📝 Segments finaux: {len(cleaned_segments)} (supprimé {len(segments_raw) - len(cleaned_segments)})")
+        logger.info(f"   🔤 Segments avec mots: {word_segments_count}/{len(cleaned_segments)}")
+        logger.info(f"   🚨 Hallucinations: {'⚠️ DÉTECTÉES' if hallucination_detected else '✅ Aucune'}")
+        logger.info(f"   🎯 Méthode utilisée: {successful_method}")
+        
+        return {
+            'success': True,
+            'transcription': result.get("text", ""),
+            'segments': cleaned_segments,
+            'language': result.get("language", "fr"),
+            'segments_raw_count': len(segments_raw),
+            'segments_cleaned_count': len(cleaned_segments),
+            'word_segments_count': word_segments_count,
+            'repetition_warning': len(suspicious_texts) > 0 or hallucination_detected,
+            'suspicious_repetitions': suspicious_texts,
+            'hallucination_detected': hallucination_detected,
+            'filter_version': "v2.0_enhanced",
+            'transcription_method': successful_method,
+            'word_timestamps_available': has_word_timestamps
+        }
         
         logger.info(f"📊 Transcription brute terminée:")
         logger.info(f"   📝 Texte: '{result.get('text', '')[:100]}...'")
@@ -1530,6 +1627,25 @@ if __name__ == "__main__":
     logger.info("   - Validation renforcée de la cohérence speakers")
     logger.info("   - Contrôle qualité multi-niveaux")
     logger.info("   - Attribution automatique intelligente en fallback")
+    logger.info("   - Gestion robuste des incompatibilités de versions")
+    
+    # Diagnostic des versions pour éviter les erreurs
+    try:
+        import transformers
+        import whisper
+        logger.info(f"📦 Versions détectées:")
+        logger.info(f"   - Whisper: {whisper.__version__ if hasattr(whisper, '__version__') else 'unknown'}")
+        logger.info(f"   - Transformers: {transformers.__version__}")
+        logger.info(f"   - PyTorch: {torch.__version__}")
+        
+        # Avertissements sur les incompatibilités connues
+        transformers_version = transformers.__version__
+        if transformers_version.startswith("4.21") or transformers_version.startswith("4.22"):
+            logger.warning("⚠️ Version Transformers potentiellement incompatible avec word_timestamps")
+            logger.info("💡 Si erreurs 'src', le fallback automatique sera utilisé")
+        
+    except Exception as version_error:
+        logger.warning(f"⚠️ Impossible de vérifier les versions: {version_error}")
     
     logger.info("⏳ Chargement initial des modèles...")
     
@@ -1537,6 +1653,11 @@ if __name__ == "__main__":
         load_models()
         if whisper_model:
             logger.info("✅ Whisper large-v2 prêt avec améliorations v2.0")
+            logger.info("🔧 Stratégies de transcription disponibles:")
+            logger.info("   1. word_timestamps_full (optimal)")
+            logger.info("   2. word_timestamps_basic (compatible)")
+            logger.info("   3. standard_optimized (fallback)")
+            logger.info("   4. minimal_safe (dernier recours)")
         else:
             logger.error("❌ Whisper non chargé")
             
@@ -1552,10 +1673,21 @@ if __name__ == "__main__":
         logger.info("   - Attribution automatique intelligente")
         logger.info("   - Métriques de qualité avancées")
         logger.info("   - Corrections d'urgence multi-niveaux")
+        logger.info("   - Gestion robuste des erreurs de compatibilité")
         
     except Exception as startup_error:
         logger.error(f"❌ Erreur chargement initial: {startup_error}")
         logger.info("⚠️ Démarrage en mode dégradé")
+        
+        # Diagnostic détaillé en cas d'erreur
+        if "src" in str(startup_error):
+            logger.error("🚨 PROBLÈME DE COMPATIBILITÉ DÉTECTÉ:")
+            logger.error("   - Erreur liée aux versions Whisper/Transformers")
+            logger.error("   - Solutions possibles:")
+            logger.error("     1. pip install --upgrade transformers")
+            logger.error("     2. pip install transformers==4.19.2")
+            logger.error("     3. pip install --upgrade openai-whisper")
+            logger.error("   - Le service utilisera les fallbacks automatiques")
     
     # Démarrage du serveur RunPod
     runpod.serverless.start({"handler": handler})
