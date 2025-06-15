@@ -1,4 +1,5 @@
 runpod
+nvidia-cudnn-cu12
 torch
 torchaudio
 faster-whisper
