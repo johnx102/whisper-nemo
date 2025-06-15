@@ -280,7 +280,7 @@ def transcribe_with_whisper(audio_path):
         logger.info("🎯 Lancement transcription avec timestamps de mots...")
         
         try:
-            # PARAMÈTRES WHISPERX-STYLE - Qualité maximale
+            # PARAMÈTRES COMPATIBLES - Éviter l'erreur src
             result = whisper_model.transcribe(
                 audio_path,
                 language='fr',
@@ -294,10 +294,11 @@ def transcribe_with_whisper(audio_path):
                 word_timestamps=True  # ✨ CLEF : Timestamps précis des mots
             )
             
-        except Exception as whisper_error:
-            logger.warning(f"⚠️ Erreur transcription avec mots: {whisper_error}")
+        except (AttributeError, RuntimeError) as whisper_error:
+            # Erreur connue avec certaines versions de Whisper
+            logger.warning(f"⚠️ Erreur transcription avec word_timestamps: {whisper_error}")
             
-            # FALLBACK: Sans word_timestamps
+            # FALLBACK 1: Sans word_timestamps mais avec paramètres optimaux
             logger.info("🔄 Fallback sans timestamps de mots...")
             try:
                 result = whisper_model.transcribe(
@@ -307,16 +308,27 @@ def transcribe_with_whisper(audio_path):
                     condition_on_previous_text=False,
                     no_speech_threshold=0.6,
                     logprob_threshold=-1.0,
-                    compression_ratio_threshold=2.4,
+                    compression_ratio_threshold=2.2,
                     temperature=0.0,
                     verbose=False
                 )
             except Exception as whisper_error2:
-                logger.error(f"❌ Échec fallback: {whisper_error2}")
-                return {
-                    'success': False,
-                    'error': f'Échec total transcription: {whisper_error2}'
-                }
+                logger.error(f"❌ Échec fallback optimisé: {whisper_error2}")
+                
+                # FALLBACK 2: Paramètres minimaux
+                logger.info("🔄 Transcription minimale...")
+                try:
+                    result = whisper_model.transcribe(
+                        audio_path,
+                        language='fr',
+                        condition_on_previous_text=False,
+                        verbose=False
+                    )
+                except Exception as whisper_error3:
+                    return {
+                        'success': False,
+                        'error': f'Échec total transcription: {whisper_error3}'
+                    }
         
         logger.info(f"📊 Transcription réussie:")
         logger.info(f"   📝 Texte: '{result.get('text', '')[:100]}...'")
@@ -376,27 +388,32 @@ def transcribe_with_whisper(audio_path):
             
             # ✨ NOUVEAU : Validation et nettoyage des timestamps de mots
             validated_words = []
-            if words:
+            if words and isinstance(words, list):
                 for word_info in words:
-                    if isinstance(word_info, dict) and 'word' in word_info:
-                        # Valider timestamps de mots
-                        word_start = word_info.get('start', start_time)
-                        word_end = word_info.get('end', end_time)
-                        
-                        # Corriger timestamps aberrants
-                        if word_start < start_time:
-                            word_start = start_time
-                        if word_end > end_time:
-                            word_end = end_time
-                        if word_start >= word_end:
-                            word_end = word_start + 0.1
-                        
-                        validated_words.append({
-                            'word': word_info['word'],
-                            'start': word_start,
-                            'end': word_end,
-                            'probability': word_info.get('probability', 1.0)
-                        })
+                    try:
+                        if isinstance(word_info, dict) and 'word' in word_info:
+                            # Valider timestamps de mots
+                            word_start = word_info.get('start', start_time)
+                            word_end = word_info.get('end', end_time)
+                            
+                            # Corriger timestamps aberrants
+                            if word_start < start_time:
+                                word_start = start_time
+                            if word_end > end_time:
+                                word_end = end_time
+                            if word_start >= word_end:
+                                word_end = word_start + 0.1
+                            
+                            validated_words.append({
+                                'word': word_info['word'],
+                                'start': word_start,
+                                'end': word_end,
+                                'probability': word_info.get('probability', 1.0)
+                            })
+                    except Exception as word_error:
+                        # Ignorer les mots problématiques
+                        logger.debug(f"Mot ignoré: {word_error}")
+                        continue
             
             # Garder le segment avec informations enrichies
             cleaned_segments.append({
@@ -525,81 +542,89 @@ def assign_speakers_to_transcription_enhanced(transcription_segments, speaker_se
         has_word_timestamps = trans_seg.get("has_word_timestamps", False)
         
         # ✨ ATTRIBUTION NIVEAU MOT (comme WhisperX)
-        if has_word_timestamps and words:
+        if has_word_timestamps and words and len(words) > 0:
             logger.info(f"🔤 Attribution précise pour segment avec {len(words)} mots")
             
             words_with_speakers = []
             segment_speaker_votes = {}
             
             for word_info in words:
-                word_start = word_info.get('start', trans_start)
-                word_end = word_info.get('end', trans_end)
-                word_center = (word_start + word_end) / 2
-                word_duration = word_end - word_start
-                
-                # Trouver le meilleur speaker pour ce mot
-                best_speaker = None
-                best_coverage = 0
-                
-                # Méthode 1: Centre du mot dans un segment de speaker
-                for spk_seg in speaker_segments:
-                    spk_start = spk_seg["start"]
-                    spk_end = spk_seg["end"]
-                    
-                    if spk_start <= word_center <= spk_end:
-                        overlap_start = max(word_start, spk_start)
-                        overlap_end = min(word_end, spk_end)
-                        overlap = max(0, overlap_end - overlap_start)
-                        coverage = overlap / word_duration if word_duration > 0 else 0
+                try:
+                    if not isinstance(word_info, dict) or 'word' not in word_info:
+                        continue
                         
-                        if coverage > best_coverage:
-                            best_coverage = coverage
-                            best_speaker = spk_seg["speaker"]
-                
-                # Méthode 2: Meilleur recouvrement si centre pas trouvé
-                if not best_speaker:
+                    word_start = word_info.get('start', trans_start)
+                    word_end = word_info.get('end', trans_end)
+                    word_center = (word_start + word_end) / 2
+                    word_duration = word_end - word_start
+                    
+                    # Trouver le meilleur speaker pour ce mot
+                    best_speaker = None
+                    best_coverage = 0
+                    
+                    # Méthode 1: Centre du mot dans un segment de speaker
                     for spk_seg in speaker_segments:
                         spk_start = spk_seg["start"]
                         spk_end = spk_seg["end"]
                         
-                        overlap_start = max(word_start, spk_start)
-                        overlap_end = min(word_end, spk_end)
-                        overlap = max(0, overlap_end - overlap_start)
-                        coverage = overlap / word_duration if word_duration > 0 else 0
-                        
-                        if coverage > best_coverage:
-                            best_coverage = coverage
-                            best_speaker = spk_seg["speaker"]
-                
-                # Fallback temporel si pas trouvé
-                if not best_speaker:
-                    min_distance = float('inf')
-                    for spk_seg in speaker_segments:
-                        spk_center = (spk_seg["start"] + spk_seg["end"]) / 2
-                        distance = abs(word_center - spk_center)
-                        if distance < min_distance:
-                            min_distance = distance
-                            best_speaker = spk_seg["speaker"]
-                
-                # Dernier recours
-                if not best_speaker or best_speaker not in known_speakers:
-                    best_speaker = known_speakers[0]
-                    best_coverage = 0.1
-                
-                # Ajouter le mot avec son speaker
-                words_with_speakers.append({
-                    'word': word_info['word'],
-                    'start': word_start,
-                    'end': word_end,
-                    'probability': word_info.get('probability', 1.0),
-                    'speaker': best_speaker,
-                    'coverage': best_coverage
-                })
-                
-                # Vote pour le speaker du segment
-                if best_speaker not in segment_speaker_votes:
-                    segment_speaker_votes[best_speaker] = 0
-                segment_speaker_votes[best_speaker] += best_coverage * word_duration
+                        if spk_start <= word_center <= spk_end:
+                            overlap_start = max(word_start, spk_start)
+                            overlap_end = min(word_end, spk_end)
+                            overlap = max(0, overlap_end - overlap_start)
+                            coverage = overlap / word_duration if word_duration > 0 else 0
+                            
+                            if coverage > best_coverage:
+                                best_coverage = coverage
+                                best_speaker = spk_seg["speaker"]
+                    
+                    # Méthode 2: Meilleur recouvrement si centre pas trouvé
+                    if not best_speaker:
+                        for spk_seg in speaker_segments:
+                            spk_start = spk_seg["start"]
+                            spk_end = spk_seg["end"]
+                            
+                            overlap_start = max(word_start, spk_start)
+                            overlap_end = min(word_end, spk_end)
+                            overlap = max(0, overlap_end - overlap_start)
+                            coverage = overlap / word_duration if word_duration > 0 else 0
+                            
+                            if coverage > best_coverage:
+                                best_coverage = coverage
+                                best_speaker = spk_seg["speaker"]
+                    
+                    # Fallback temporel si pas trouvé
+                    if not best_speaker:
+                        min_distance = float('inf')
+                        for spk_seg in speaker_segments:
+                            spk_center = (spk_seg["start"] + spk_seg["end"]) / 2
+                            distance = abs(word_center - spk_center)
+                            if distance < min_distance:
+                                min_distance = distance
+                                best_speaker = spk_seg["speaker"]
+                    
+                    # Dernier recours
+                    if not best_speaker or best_speaker not in known_speakers:
+                        best_speaker = known_speakers[0]
+                        best_coverage = 0.1
+                    
+                    # Ajouter le mot avec son speaker
+                    words_with_speakers.append({
+                        'word': word_info['word'],
+                        'start': word_start,
+                        'end': word_end,
+                        'probability': word_info.get('probability', 1.0),
+                        'speaker': best_speaker,
+                        'coverage': best_coverage
+                    })
+                    
+                    # Vote pour le speaker du segment
+                    if best_speaker not in segment_speaker_votes:
+                        segment_speaker_votes[best_speaker] = 0
+                    segment_speaker_votes[best_speaker] += best_coverage * word_duration
+                    
+                except Exception as word_error:
+                    logger.debug(f"Erreur traitement mot: {word_error}")
+                    continue
             
             # Déterminer le speaker principal du segment par vote pondéré
             if segment_speaker_votes:
