@@ -222,6 +222,10 @@ def safe_text_for_logging(text, max_length=40):
         safe_text = safe_text[:max_length] + "..."
     
     return safe_text
+
+def format_timestamp(seconds):
+    """Convertit les secondes en format mm:ss"""
+    return str(timedelta(seconds=int(seconds)))[2:]
     """Convertit les secondes en format mm:ss"""
     return str(timedelta(seconds=int(seconds)))[2:]
 
