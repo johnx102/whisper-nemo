@@ -1,5 +1,5 @@
 # Image de base avec CUDA support optimisée pour serverless
-FROM tinyy/whisper-x-runpod
+FROM pytorch/pytorch:2.7.1-cuda12.8-cudnn9-runtime
 
 # Variables d'environnement
 ENV DEBIAN_FRONTEND=noninteractive
