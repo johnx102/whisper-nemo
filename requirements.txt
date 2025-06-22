@@ -1,14 +1,1 @@
-runpod
-nvidia-cudnn-cu12
-torch
-torchaudio
-faster-whisper
-pyannote.audio
-transformers
-huggingface-hub
-soundfile
-requests
-numpy
-scipy
-speechbrain
-onnxruntime
+
