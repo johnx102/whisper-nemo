@@ -43,7 +43,7 @@ RUN pip install --no-cache-dir \
 
 # Installation packages - EXACTEMENT comme votre script
 RUN pip install --no-cache-dir \
-    openai-whisper==20231117 \
+    openai-whisper==20240930 \
     pyannote.audio \
     huggingface_hub \
     numpy
